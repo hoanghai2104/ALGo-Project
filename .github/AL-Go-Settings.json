@@ -7,8 +7,13 @@
     "TEST"
   ],
   "DeployToTEST": {
-    "continuousDeployment": true
+    "EnvironmentName": "Sandbox_ThangNT",
+    "continuousDeployment": true,
+    "Branches": [
+      "main"
+    ]
   },
+  "TEST-AuthContextSecretName": "ALGOPROJECTAPP_AUTHCONTEXT",
   "DeployToPROD": {
     "continuousDeployment": false
   }
