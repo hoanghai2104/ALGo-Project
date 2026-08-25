@@ -1,5 +1,15 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v9.2/.Modules/settings.schema.json",
   "type": "PTE",
-  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main"
+  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
+  "environments": [
+    "PROD",
+    "TEST"
+  ],
+  "DeployToTEST": {
+    "continuousDeployment": true
+  },
+  "DeployToPROD": {
+    "continuousDeployment": false
+  }
 }
