@@ -381,6 +381,7 @@ jobs:
         shell: pwsh
         env:
           environmentName: ${{ steps.showEnvironment.outputs.environmentName }}
+          platformVersion: ${{ steps.showEnvironment.outputs.platformVersion }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -389,22 +390,39 @@ jobs:
 
           if (!$env:bcAccessToken) { throw "No access token available - the 'Show environment' step must run first." }
           $headers = @{ Authorization = "Bearer $($env:bcAccessToken)" }
-          $devServerUrl = "https://api.businesscentral.dynamics.com/v2.0/$($env:environmentName)"
+          $environmentName = $env:environmentName
           $tenant = $env:bcTenantId
-          Write-Host "Dev endpoint        : $devServerUrl/dev/packages"
+          $devServerUrl = "https://api.businesscentral.dynamics.com/v2.0/$environmentName"
 
-          # --- Build the list of symbols to download (Microsoft apps only) ---
-          $symbols = New-Object System.Collections.Generic.List[object]
+          # --- 1. Ask PROD which apps are actually installed, and at which version ---
+          $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$tenant/$environmentName/api/microsoft/automation/v2.0"
+          $companies = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value)
+          if ($companies.Count -eq 0) { throw "No companies returned from $automationApi/companies" }
+          $installedApps = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies($($companies[0].id))/extensions" -Headers $headers).value)
+          Write-Host "Environment         : $environmentName"
+          Write-Host "Apps installed      : $($installedApps.Count)"
+
+          function Get-InstalledApp {
+            param([string] $name, [string] $appId)
+            $match = $null
+            if ($appId) { $match = $installedApps | Where-Object { "$($_.id)" -eq $appId } | Select-Object -First 1 }
+            if (!$match -and $name) { $match = $installedApps | Where-Object { $_.displayName -eq $name } | Select-Object -First 1 }
+            if ($match -and $match.PSObject.Properties.Name -contains 'isInstalled' -and !$match.isInstalled) { return $null }
+            return $match
+          }
+
+          # --- 2. Which symbols do we want? (app.json, Microsoft publisher only) ---
+          $wanted = New-Object System.Collections.Generic.List[object]
           $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-          function Add-Symbol {
-            param([string] $publisher, [string] $name, [string] $version, [string] $appId)
-            if (!$name -or !$version) { return }
+          function Add-Wanted {
+            param([string] $publisher, [string] $name, [string] $declaredVersion, [string] $appId)
+            if (!$name) { return }
             if ($publisher -ne 'Microsoft') {
-              Write-Host "  skipping $publisher / $name (not published by Microsoft)"
+              Write-Host "  skip $publisher / $name - publisher is not Microsoft"
               return
             }
-            if (!$seen.Add("$publisher|$name")) { return }
-            $symbols.Add([PSCustomObject]@{ publisher = $publisher; name = $name; version = $version; appId = $appId })
+            if (!$seen.Add($name)) { return }
+            $wanted.Add([PSCustomObject]@{ publisher = $publisher; name = $name; declaredVersion = $declaredVersion; appId = $appId })
           }
 
           $excludedFolders = @('.alpackages', '.snapshots', '.git', 'node_modules', '.output', 'custom-output')
@@ -419,99 +437,124 @@ jobs:
             Write-Host "=== $($app.name) $($app.version) ==="
             # "platform" -> Microsoft/System, "application" -> Microsoft/Application + Base Application
             if ($app.PSObject.Properties.Name -contains 'platform' -and $app.platform) {
-              Add-Symbol -publisher 'Microsoft' -name 'System' -version $app.platform -appId '8874ed3a-0643-4247-9ced-7a7002f7135d'
+              Add-Wanted -publisher 'Microsoft' -name 'System' -declaredVersion $app.platform -appId '8874ed3a-0643-4247-9ced-7a7002f7135d'
             }
             if ($app.PSObject.Properties.Name -contains 'application' -and $app.application) {
-              Add-Symbol -publisher 'Microsoft' -name 'Application' -version $app.application -appId 'c1335042-3002-4257-bf8a-75c898ccb1b8'
-              Add-Symbol -publisher 'Microsoft' -name 'Base Application' -version $app.application -appId ''
+              Add-Wanted -publisher 'Microsoft' -name 'Application' -declaredVersion $app.application -appId 'c1335042-3002-4257-bf8a-75c898ccb1b8'
+              Add-Wanted -publisher 'Microsoft' -name 'Base Application' -declaredVersion $app.application -appId ''
             }
-            # explicit dependencies from app.json
             if ($app.PSObject.Properties.Name -contains 'dependencies' -and $app.dependencies) {
               foreach($dependency in @($app.dependencies)) {
                 $appId = ''
                 foreach($idName in @('id','appId')) {
                   if ($dependency.PSObject.Properties.Name -contains $idName -and $dependency."$idName") { $appId = $dependency."$idName"; break }
                 }
-                Add-Symbol -publisher $dependency.publisher -name $dependency.name -version $dependency.version -appId $appId
+                Add-Wanted -publisher $dependency.publisher -name $dependency.name -declaredVersion $dependency.version -appId $appId
               }
             }
           }
-          Write-Host "Symbols to download : $($symbols.Count)"
 
-          # --- Download each symbol package from the environment ---
+          # --- 3. Resolve every wanted app against what PROD really has ---
+          $toDownload = @()
+          $skipped = @()
+          foreach($item in $wanted) {
+            $installedApp = Get-InstalledApp -name $item.name -appId $item.appId
+
+            if (!$installedApp) {
+              # The platform app ("System") is not an extension, so it never shows up in the list
+              if ($item.name -eq 'System') {
+                $systemVersion = $env:platformVersion
+                if (!$systemVersion) {
+                  $systemVersion = $item.declaredVersion
+                  Write-Host "::warning::Platform version of $environmentName is unknown (Admin Center API was not available) - requesting System symbols with the app.json version $systemVersion instead."
+                }
+                $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = 'System'; version = $systemVersion; appId = $item.appId }
+              }
+              else {
+                Write-Host "::warning::$($item.name) is not installed on $environmentName - skipped."
+                $skipped += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "not installed on $environmentName" }
+              }
+              continue
+            }
+
+            if ($installedApp.publisher -ne 'Microsoft') {
+              Write-Host "::warning::$($item.name) is published by $($installedApp.publisher) on $environmentName, not Microsoft - skipped."
+              $skipped += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "publisher on $environmentName is $($installedApp.publisher)" }
+              continue
+            }
+
+            $installedVersion = "$($installedApp.versionMajor).$($installedApp.versionMinor).$($installedApp.versionBuild).$($installedApp.versionRevision)"
+            if ($item.declaredVersion -and ([System.Version]$installedVersion -lt [System.Version]$item.declaredVersion)) {
+              Write-Host "::warning::$($item.name) is $installedVersion on $environmentName but app.json requires $($item.declaredVersion) - downloading the installed version, the build will not be able to satisfy the dependency."
+            }
+            $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = $item.name; version = $installedVersion; appId = "$($installedApp.id)" }
+          }
+          Write-Host "To download         : $($toDownload.Count) (skipped $($skipped.Count))"
+
+          # --- 4. Download each symbol package at the version installed on PROD ---
           $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
           $downloaded = @()
           $failed = @()
-          foreach($symbol in $symbols) {
-            $fileName = ("$($symbol.publisher)_$($symbol.name)_$($symbol.version).app").Split($invalidChars) -join ''
+          foreach($item in $toDownload) {
+            $fileName = ("$($item.publisher)_$($item.name)_$($item.version).app").Split($invalidChars) -join ''
             $targetFile = Join-Path $symbolsFolder $fileName
-
-            if ($symbol.appId) {
-              $url = "$devServerUrl/dev/packages?appId=$($symbol.appId)&versionText=$($symbol.version)&tenant=$tenant"
+            if ($item.appId) {
+              $url = "$devServerUrl/dev/packages?appId=$($item.appId)&versionText=$($item.version)&tenant=$tenant"
             }
             else {
-              $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($symbol.publisher))&appName=$([uri]::EscapeDataString($symbol.name))&versionText=$($symbol.version)&tenant=$tenant"
+              $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&versionText=$($item.version)&tenant=$tenant"
             }
 
-            Write-Host "Downloading $($symbol.publisher) / $($symbol.name) $($symbol.version)"
+            Write-Host "Downloading $($item.name) $($item.version)"
             try {
-              $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $targetFile -PassThru
-
-              # Prefer the file name the endpoint reports - it carries the real installed version
-              try {
-                if ($response.Headers.ContainsKey('Content-Disposition')) {
-                  $disposition = ($response.Headers['Content-Disposition'] -join ';')
-                  $match = [regex]::Match($disposition, 'filename[^=]*=\s*"?([^";]+)"?')
-                  if ($match.Success) {
-                    $realName = $match.Groups[1].Value.Trim().Trim('"')
-                    if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
-                    $realName = [System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))
-                    $realName = $realName.Split($invalidChars) -join ''
-                    if ($realName -and $realName -ne $fileName) {
-                      Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
-                      $fileName = $realName
-                      $targetFile = Join-Path $symbolsFolder $realName
-                    }
-                  }
-                }
-              }
-              catch {
-                Write-Host "  could not read the file name from the response - keeping $fileName"
-              }
-
+              Invoke-WebRequest -Uri $url -Headers $headers -OutFile $targetFile
               $sizeMb = [Math]::Round((Get-Item $targetFile).Length / 1MB, 2)
               Write-Host "  -> $fileName ($sizeMb MB)"
-              $downloaded += [PSCustomObject]@{ name = $symbol.name; file = $fileName; sizeMb = $sizeMb }
+              $downloaded += [PSCustomObject]@{ name = $item.name; version = $item.version; file = $fileName; sizeMb = $sizeMb }
             }
             catch {
               if (Test-Path $targetFile) { Remove-Item $targetFile -Force }
               $statusCode = ''
               try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-              $reason = "it is probably not installed on $($env:environmentName)"
-              if ($statusCode -in @(401, 403)) { $reason = "the Entra app lacks access to the development endpoint of $($env:environmentName)" }
-              Write-Host "::warning::Could not download $($symbol.publisher) / $($symbol.name) $($symbol.version) (HTTP $statusCode) - $reason."
-              $failed += "$($symbol.publisher) / $($symbol.name) $($symbol.version) (HTTP $statusCode)"
+              $reason = "HTTP $statusCode"
+              if ($statusCode -in @(401, 403)) { $reason = "HTTP $statusCode - the Entra app lacks access to the development endpoint of $environmentName" }
+              Write-Host "::warning::Could not download $($item.name) $($item.version) ($reason)."
+              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = $reason }
             }
           }
 
           if ($downloaded.Count -eq 0) {
-            throw "No symbols could be downloaded from $($env:environmentName). Check that the Entra app is registered in the environment with the D365 EXTENSION MGT permission set."
+            throw "No symbols could be downloaded from $environmentName. Check that the Entra app is registered in the environment with the D365 EXTENSION MGT permission set."
           }
-          Write-Host "Downloaded $($downloaded.Count) of $($symbols.Count) symbol packages to $symbolsFolder"
+          Write-Host "Downloaded $($downloaded.Count) symbol package(s) to $symbolsFolder"
 
-          # --- Outputs / summary ---
+          # --- Outputs ---
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolCount=$($downloaded.Count)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "skippedCount=$($skipped.Count + $failed.Count)"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolsFolder=$symbolsFolder"
 
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols downloaded from $($env:environmentName) ($($downloaded.Count))`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | File | Size (MB) |`n| --- | --- | --- |"
+          # --- Note file, shipped inside the artifact ---
+          $noteFile = Join-Path $symbolsFolder 'symbols.txt'
+          Set-Content -Encoding UTF8 -Path $noteFile -Value "Symbols downloaded from $environmentName"
           foreach($item in $downloaded) {
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.file) | $($item.sizeMb) |"
+            Add-Content -Encoding UTF8 -Path $noteFile -Value "downloaded;$($item.name);$($item.version);$($item.file)"
           }
-          if ($failed.Count -gt 0) {
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`nNot downloaded:`n"
-            foreach($item in $failed) {
-              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "- $item"
+          foreach($item in ($skipped + $failed)) {
+            Add-Content -Encoding UTF8 -Path $noteFile -Value "skipped;$($item.name);$($item.declaredVersion);$($item.reason)"
+          }
+          Write-Host "Wrote $noteFile"
+
+          # --- Job summary ---
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols from $environmentName ($($downloaded.Count))`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed version | File | Size (MB) |`n| --- | --- | --- | --- |"
+          foreach($item in $downloaded) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.file) | $($item.sizeMb) |"
+          }
+          if (($skipped.Count + $failed.Count) -gt 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Skipped ($($skipped.Count + $failed.Count))`n"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | app.json version | Reason |`n| --- | --- | --- |"
+            foreach($item in ($skipped + $failed)) {
+              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.declaredVersion) | $($item.reason) |"
             }
           }
 
