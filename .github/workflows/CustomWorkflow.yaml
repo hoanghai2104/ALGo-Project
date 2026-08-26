@@ -180,6 +180,7 @@ jobs:
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "environmentName=$environmentName"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "applicationVersion=$applicationVersion"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$platformVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "countryCode=$countryCode"
 
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $environmentName |`n| Type | $environmentType |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |"
 
@@ -272,6 +273,97 @@ jobs:
               Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($dependency.app) | $($dependency.publisher) | $($dependency.name) | $($dependency.version) |"
             }
           }
+
+      - name: Get latest version
+        id: getLatestVersion
+        shell: pwsh
+        env:
+          countryCode: ${{ steps.showEnvironment.outputs.countryCode }}
+          currentVersion: ${{ steps.showEnvironment.outputs.applicationVersion }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          # --- Localization: PROD environment countryCode -> AL-Go "country" setting -> w1 ---
+          $country = $env:countryCode
+          $countrySource = 'PROD environment'
+          if (!$country) {
+            $settings = $env:Settings | ConvertFrom-Json
+            if ($settings.PSObject.Properties.Name -contains 'country' -and $settings.country) {
+              $country = $settings.country
+              $countrySource = 'AL-Go setting "country"'
+            }
+          }
+          if (!$country) {
+            $country = 'w1'
+            $countrySource = 'default'
+          }
+          $country = $country.ToLowerInvariant()
+          Write-Host "Localization        : $country (from $countrySource)"
+
+          if (-not (Get-Module -ListAvailable -Name BcContainerHelper)) {
+            Write-Host "Installing BcContainerHelper"
+            Install-Module -Name BcContainerHelper -Scope CurrentUser -Force -Confirm:$false
+          }
+          Import-Module BcContainerHelper -DisableNameChecking
+
+          # --- Latest available Business Central version for that localization ---
+          $artifactUrl = Get-BCArtifactUrl -type Sandbox -country $country -select Latest
+          if (!$artifactUrl) {
+            Write-Host "::warning::No sandbox artifacts found for localization '$country'. Falling back to w1."
+            $country = 'w1'
+            $artifactUrl = Get-BCArtifactUrl -type Sandbox -country $country -select Latest
+          }
+          if (!$artifactUrl) {
+            throw "Could not determine the latest Business Central version for localization '$country'."
+          }
+          # .../sandbox/<version>/<country>
+          $segments = ([Uri]$artifactUrl).AbsolutePath.Trim('/').Split('/')
+          $latestVersion = $segments[1]
+          Write-Host "Latest version      : $latestVersion"
+          Write-Host "Artifact url        : $artifactUrl"
+
+          # --- Latest version within the major currently running on PROD ---
+          $currentVersion = $env:currentVersion
+          $latestVersionSameMajor = ''
+          $updateAvailable = $false
+          $major = ''
+          if ($currentVersion) {
+            $major = $currentVersion.Split('.')[0]
+            $sameMajorUrl = Get-BCArtifactUrl -type Sandbox -country $country -version $major -select Latest
+            if ($sameMajorUrl) {
+              $latestVersionSameMajor = ([Uri]$sameMajorUrl).AbsolutePath.Trim('/').Split('/')[1]
+            }
+            $updateAvailable = ([System.Version]$latestVersion -gt [System.Version]$currentVersion)
+            Write-Host "PROD version        : $currentVersion"
+            Write-Host "Latest in major $major  : $latestVersionSameMajor"
+            Write-Host "Update available    : $updateAvailable"
+          }
+          else {
+            Write-Host "::warning::No PROD application version available - skipping the version comparison."
+          }
+
+          # --- Outputs for later steps ---
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "country=$country"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "latestVersion=$latestVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "latestVersionSameMajor=$latestVersionSameMajor"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "artifactUrl=$artifactUrl"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "updateAvailable=$updateAvailable"
+
+          # --- Artifact file (picked up by the upload-artifact step) ---
+          $outputFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
+          New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
+          $versionFile = Join-Path $outputFolder 'versions.txt'
+          Set-Content -Encoding UTF8 -Path $versionFile -Value "localization=$country"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "prodVersion=$currentVersion"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "latestVersion=$latestVersion"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "latestVersionSameMajor=$latestVersionSameMajor"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "updateAvailable=$updateAvailable"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "artifactUrl=$artifactUrl"
+          Write-Host "Wrote $versionFile"
+
+          # --- Job summary ---
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Latest version ($country)`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Property | Value |`n| --- | --- |`n| Localization | $country |`n| PROD version | $currentVersion |`n| Latest available | $latestVersion |`n| Latest in major $major | $latestVersionSameMajor |`n| Update available | $updateAvailable |"
 
       - name: Generate Symbols
         shell: pwsh
