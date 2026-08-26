@@ -1,0 +1,29 @@
+name: ' Custom Workflow'
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-symbols:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          Write-Host "Running BC Symbol generation"
+
+      - name: Generate Symbols
+        shell: pwsh
+        run: |
+          # Your CreateSymbolPackage command here
+          Write-Host "CreateSymbolPackage"
+
+      - name: Create TempText File
+        uses: actions/upload-artifact@v4
+        with:
+          name: temp-text
+          path: custom-output/customArtifacts/
