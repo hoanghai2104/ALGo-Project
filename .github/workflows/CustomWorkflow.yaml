@@ -17,13 +17,13 @@ jobs:
     runs-on: windows-latest
 
     # Use the existing GitHub Environment (settings -> Environments) so its
-    # secrets/variables (e.g. ALGOPROJECTAPPPROD_AUTHCONTEXT) are available here
+    # secrets/variables (e.g. ALGOPROJECTAPP_AUTHCONTEXT) are available here
     environment:
-      name: PROD
+      name: TEST
 
     env:
       ALGoEnvSettings: ${{ vars.ALGoEnvironmentSettings }}
-      ALGoEnvName: 'PROD'
+      ALGoEnvName: 'TEST'
 
     steps:
       - name: Checkout
@@ -40,7 +40,7 @@ jobs:
         with:
           shell: pwsh
           gitHubSecrets: ${{ toJson(secrets) }}
-          getSecrets: 'PROD-AuthContext,ALGOPROJECTAPPPROD_AUTHCONTEXT,AuthContext'
+          getSecrets: 'TEST-AuthContext,ALGOPROJECTAPP_AUTHCONTEXT,AuthContext'
 
       - name: Show environment
         id: showEnvironment
@@ -52,19 +52,19 @@ jobs:
 
           Write-Host "Running BC Symbol generation"
 
-          # --- Environment name from AL-Go settings (DeployToPROD.EnvironmentName) ---
+          # --- Environment name from AL-Go settings (DeployToTEST.EnvironmentName) ---
           $settings = $env:Settings | ConvertFrom-Json
-          $environmentName = 'Production'
-          if ($settings.PSObject.Properties.Name -contains 'DeployToPROD' -and $settings.DeployToPROD.EnvironmentName) {
-            $environmentName = $settings.DeployToPROD.EnvironmentName
+          $environmentName = 'Sandbox_ThangNT'
+          if ($settings.PSObject.Properties.Name -contains 'DeployToTEST' -and $settings.DeployToTEST.EnvironmentName) {
+            $environmentName = $settings.DeployToTEST.EnvironmentName
           }
-          Write-Host "GitHub environment : PROD"
+          Write-Host "GitHub environment : TEST"
           Write-Host "BC environment     : $environmentName"
 
           # --- AuthContext from the GitHub Environment secret ---
           $secrets = $env:Secrets | ConvertFrom-Json
           $authContextJson = $null
-          foreach($secretName in @('PROD-AuthContext','ALGOPROJECTAPPPROD_AUTHCONTEXT','AuthContext')) {
+          foreach($secretName in @('TEST-AuthContext','ALGOPROJECTAPP_AUTHCONTEXT','AuthContext')) {
             if (!$authContextJson -and $secrets.PSObject.Properties.Name -contains $secretName -and $secrets."$secretName") {
               $value = $secrets."$secretName"
               # ReadSecrets returns secret values base64 encoded - fall back to raw value
@@ -74,7 +74,7 @@ jobs:
             }
           }
           if (!$authContextJson) {
-            throw "No AuthContext secret found for environment PROD. Expected ALGOPROJECTAPPPROD_AUTHCONTEXT (see .github/AL-Go-Settings.json)."
+            throw "No AuthContext secret found for environment TEST. Expected ALGOPROJECTAPP_AUTHCONTEXT (see .github/AL-Go-Settings.json)."
           }
 
           # --- Get an access token for the BC Admin Center API ---
@@ -112,7 +112,7 @@ jobs:
           Add-Content -Encoding UTF8 -Path $env:GITHUB_ENV -Value "bcAccessToken=$token"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_ENV -Value "bcTenantId=$tenantId"
 
-          # --- Current version of the PROD environment ---
+          # --- Current version of the TEST environment ---
           # Preferred: Admin Center API (gives both platform and application version).
           # Requires the Entra app to have the "AdminCenter.ReadWrite.All" application
           # permission AND to be listed on "Authorized Microsoft Entra apps" in the BC
@@ -187,7 +187,7 @@ jobs:
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$platformVersion"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "countryCode=$countryCode"
 
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $environmentName |`n| Type | $environmentType |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## TEST environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $environmentName |`n| Type | $environmentType |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |"
 
       - name: Read dependencies
         id: readDependencies
@@ -288,9 +288,9 @@ jobs:
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
-          # --- Localization: PROD environment countryCode -> AL-Go "country" setting -> w1 ---
+          # --- Localization: TEST environment countryCode -> AL-Go "country" setting -> w1 ---
           $country = $env:countryCode
-          $countrySource = 'PROD environment'
+          $countrySource = 'TEST environment'
           if (!$country) {
             $settings = $env:Settings | ConvertFrom-Json
             if ($settings.PSObject.Properties.Name -contains 'country' -and $settings.country) {
@@ -327,7 +327,7 @@ jobs:
           Write-Host "Latest version      : $latestVersion"
           Write-Host "Artifact url        : $artifactUrl"
 
-          # --- Latest version within the major currently running on PROD ---
+          # --- Latest version within the major currently running on TEST ---
           $currentVersion = $env:currentVersion
           $latestVersionSameMajor = ''
           $updateAvailable = $false
@@ -339,12 +339,12 @@ jobs:
               $latestVersionSameMajor = ([Uri]$sameMajorUrl).AbsolutePath.Trim('/').Split('/')[1]
             }
             $updateAvailable = ([System.Version]$latestVersion -gt [System.Version]$currentVersion)
-            Write-Host "PROD version        : $currentVersion"
+            Write-Host "TEST version        : $currentVersion"
             Write-Host "Latest in major $major  : $latestVersionSameMajor"
             Write-Host "Update available    : $updateAvailable"
           }
           else {
-            Write-Host "::warning::No PROD application version available - skipping the version comparison."
+            Write-Host "::warning::No TEST application version available - skipping the version comparison."
           }
 
           # --- Outputs for later steps ---
@@ -359,7 +359,7 @@ jobs:
           New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
           $versionFile = Join-Path $outputFolder 'versions.txt'
           Set-Content -Encoding UTF8 -Path $versionFile -Value "localization=$country"
-          Add-Content -Encoding UTF8 -Path $versionFile -Value "prodVersion=$currentVersion"
+          Add-Content -Encoding UTF8 -Path $versionFile -Value "testVersion=$currentVersion"
           Add-Content -Encoding UTF8 -Path $versionFile -Value "latestVersion=$latestVersion"
           Add-Content -Encoding UTF8 -Path $versionFile -Value "latestVersionSameMajor=$latestVersionSameMajor"
           Add-Content -Encoding UTF8 -Path $versionFile -Value "updateAvailable=$updateAvailable"
@@ -368,7 +368,7 @@ jobs:
 
           # --- Job summary ---
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Latest version ($country)`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Property | Value |`n| --- | --- |`n| Localization | $country |`n| PROD version | $currentVersion |`n| Latest available | $latestVersion |`n| Latest in major $major | $latestVersionSameMajor |`n| Update available | $updateAvailable |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Property | Value |`n| --- | --- |`n| Localization | $country |`n| TEST version | $currentVersion |`n| Latest available | $latestVersion |`n| Latest in major $major | $latestVersionSameMajor |`n| Update available | $updateAvailable |"
 
       - name: Generate Symbols
         shell: pwsh
@@ -395,7 +395,7 @@ jobs:
           $tenant = $env:bcTenantId
           $devServerUrl = "https://api.businesscentral.dynamics.com/v2.0/$environmentName"
 
-          # --- 1. Ask PROD which apps are actually installed, and at which version ---
+          # --- 1. Ask TEST which apps are actually installed, and at which version ---
           $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$tenant/$environmentName/api/microsoft/automation/v2.0"
           $companies = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value)
           if ($companies.Count -eq 0) { throw "No companies returned from $automationApi/companies" }
@@ -455,7 +455,7 @@ jobs:
             }
           }
 
-          # --- 3. Resolve every wanted app against what PROD really has ---
+          # --- 3. Resolve every wanted app against what TEST really has ---
           $toDownload = @()
           $skipped = @()
           foreach($item in $wanted) {
@@ -492,7 +492,7 @@ jobs:
           }
           Write-Host "To download         : $($toDownload.Count) (skipped $($skipped.Count))"
 
-          # --- 4. Download each symbol package at the version installed on PROD ---
+          # --- 4. Download each symbol package at the version installed on TEST ---
           $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
           $downloaded = @()
           $failed = @()
@@ -622,7 +622,7 @@ jobs:
 
           # --- Job summary ---
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols from $environmentName ($($downloaded.Count))`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed on PROD | Requested | File | Size (MB) |`n| --- | --- | --- | --- | --- |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed on TEST | Requested | File | Size (MB) |`n| --- | --- | --- | --- | --- |"
           foreach($item in $downloaded) {
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.requested) | $($item.file) | $($item.sizeMb) |"
           }
