@@ -383,24 +383,51 @@ jobs:
           environmentName: ${{ steps.showEnvironment.outputs.environmentName }}
           platformVersion: ${{ steps.showEnvironment.outputs.platformVersion }}
           applicationVersion: ${{ steps.showEnvironment.outputs.applicationVersion }}
+          country: ${{ steps.getLatestVersion.outputs.country }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
-          $symbolsFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
-          New-Item -Path $symbolsFolder -ItemType Directory -Force | Out-Null
+          # Symbols come from the public Microsoft NuGet feed, not from the development
+          # endpoint of the environment. The dev endpoint only serves the build that the
+          # environment happens to run, needs that environment to allow development access
+          # (production environments do not) and answers HTTP 500 for anything else. The
+          # feed is anonymous, keeps every released version, and a symbol package is a few
+          # MB against ~1-2 GB for a full BC artifact - so one source can serve both the
+          # version currently on the environment and the latest released version.
+          $rootFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
+          $currentFolder = Join-Path $rootFolder 'symbols/current'
+          $latestFolder = Join-Path $rootFolder 'symbols/latest'
+          foreach($folder in @($rootFolder, $currentFolder, $latestFolder)) {
+            New-Item -Path $folder -ItemType Directory -Force | Out-Null
+          }
 
           if (!$env:bcAccessToken) { throw "No access token available - the 'Show environment' step must run first." }
           $headers = @{ Authorization = "Bearer $($env:bcAccessToken)" }
           $environmentName = $env:environmentName
           $tenant = $env:bcTenantId
-          $devServerUrl = "https://api.businesscentral.dynamics.com/v2.0/$environmentName"
+          $country = 'w1'
+          if ($env:country) { $country = $env:country.ToLowerInvariant() }
+          $cc = $country.ToUpperInvariant()
+          Write-Host "Environment         : $environmentName"
+          Write-Host "Localization        : $country"
 
-          # --- 1. Ask TEST which apps are actually installed, and at which version ---
+          # --- 0. The symbols feed (anonymous - never send the BC token here) ---
+          $feedUrl = 'https://dynamicssmb2.pkgs.visualstudio.com/DynamicsBCPublicFeeds/_packaging/MSSymbols/nuget/v3/index.json'
+          $feedIndex = Invoke-RestMethod -Method Get -Uri $feedUrl
+          $searchService = ''
+          $packageBase = ''
+          foreach($resource in $feedIndex.resources) {
+            if ($resource.'@type' -eq 'SearchQueryService/3.0.0-beta') { $searchService = $resource.'@id' }
+            if ($resource.'@type' -eq 'PackageBaseAddress/3.0.0') { $packageBase = $resource.'@id' }
+          }
+          if (!$searchService -or !$packageBase) { throw "Could not read the search/download endpoints from $feedUrl." }
+          Write-Host "Symbols feed        : MSSymbols (public)"
+
+          # --- 1. Ask the environment which apps are installed, and at which version ---
           $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$tenant/$environmentName/api/microsoft/automation/v2.0"
           $companies = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value)
           if ($companies.Count -eq 0) { throw "No companies returned from $automationApi/companies" }
           $installedApps = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies($($companies[0].id))/extensions" -Headers $headers).value)
-          Write-Host "Environment         : $environmentName"
           Write-Host "Apps installed      : $($installedApps.Count)"
 
           function Get-InstalledApp {
@@ -455,7 +482,7 @@ jobs:
             }
           }
 
-          # --- 3. Resolve every wanted app against what TEST really has ---
+          # --- 3. Resolve every wanted app against what the environment really has ---
           $toDownload = @()
           $skipped = @()
           foreach($item in $wanted) {
@@ -492,128 +519,200 @@ jobs:
           }
           Write-Host "To download         : $($toDownload.Count) (skipped $($skipped.Count))"
 
-          # --- 4. Download each symbol package at the version installed on TEST ---
-          $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
-          $downloaded = @()
-          $failed = @()
-          # The dev endpoint is addressable in two documented shapes, and it only serves
-          # versions it has actually published (answering HTTP 500 otherwise). Try both shapes
-          # against progressively less specific versions, and log the response body of every
-          # failure - that body is what says whether the problem is the version, the URL or
-          # the environment refusing development access at all.
-          $urlForms = @(
-            [PSCustomObject]@{ label = 'environment'; url = "https://api.businesscentral.dynamics.com/v2.0/$environmentName/dev/packages" },
-            [PSCustomObject]@{ label = 'tenant+environment'; url = "https://api.businesscentral.dynamics.com/v2.0/$tenant/$environmentName/dev/packages" }
-          )
-          $workingForm = ''
+          # --- 4. Map each app onto a feed package id ---
+          # Ids are Microsoft.<Name>[.<CC>].symbols.<appId>, the variant without a country
+          # segment being W1. Looking the id up by appId avoids having to reproduce NuGet's
+          # name normalisation. The two framework packages are the exception - they carry no
+          # appId at all: Microsoft.Platform.symbols and Microsoft.Application[.<CC>].symbols.
+          function Get-PackageIdCandidates {
+            param([string] $name, [string] $appId)
 
-          foreach($item in $toDownload) {
-            $versionCandidates = @()
-            foreach($candidate in @($item.version, $item.declaredVersion, "$(([System.Version]$item.version).Major).0.0.0", '')) {
-              if ($versionCandidates -notcontains $candidate) { $versionCandidates += $candidate }
+            if ($name -eq 'System') { return @('Microsoft.Platform.symbols') }
+            if ($name -eq 'Application') {
+              if ($country -eq 'w1') { return @('Microsoft.Application.symbols') }
+              return @("Microsoft.Application.$cc.symbols", 'Microsoft.Application.symbols')
             }
+            if (!$appId) { return @() }
 
-            # Once one shape works, keep using it instead of probing again for every app
-            $formsToTry = $urlForms
-            if ($workingForm) { $formsToTry = @($urlForms | Where-Object { $_.label -eq $workingForm }) }
+            $ids = @()
+            try {
+              $result = Invoke-RestMethod -Method Get -Uri "$searchService`?q=$appId&take=100&prerelease=true"
+              if ($result.PSObject.Properties.Name -contains 'data' -and $result.data) {
+                $ids = @($result.data | ForEach-Object { $_.id } | Where-Object { $_.EndsWith(".symbols.$appId", 'OrdinalIgnoreCase') })
+              }
+            }
+            catch {
+              Write-Host "  feed search failed for $appId - $($_.Exception.Message)"
+            }
+            if ($ids.Count -eq 0) { return @() }
 
-            $targetFile = ''
-            $usedVersion = ''
-            $lastError = ''
-            $permissionDenied = $false
+            $candidates = @()
+            if ($country -ne 'w1') {
+              $candidates += @($ids | Where-Object { $_.EndsWith(".$cc.symbols.$appId", 'OrdinalIgnoreCase') })
+            }
+            # The W1 variant is the one without a country segment, so it is the shortest id
+            $candidates += @($ids | Sort-Object { $_.Length } | Select-Object -First 1)
+            return @($candidates | Select-Object -Unique)
+          }
 
-            foreach($form in $formsToTry) {
-              foreach($versionText in $versionCandidates) {
-                if ($item.appId) {
-                  $query = "appId=$($item.appId)&tenant=$tenant"
-                }
-                else {
-                  $query = "publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&tenant=$tenant"
-                }
-                if ($versionText) { $query += "&versionText=$versionText" }
-                $url = "$($form.url)?$query"
+          $versionCache = @{}
+          function Get-PackageVersions {
+            param([string] $packageId)
+            # The flat container is addressed with the lower-cased package id
+            $lowerId = $packageId.ToLowerInvariant()
+            if ($versionCache.ContainsKey($lowerId)) { return $versionCache[$lowerId] }
+            $versions = @()
+            try {
+              $result = Invoke-RestMethod -Method Get -Uri "$packageBase$lowerId/index.json"
+              if ($result.PSObject.Properties.Name -contains 'versions' -and $result.versions) {
+                $versions = @($result.versions)
+              }
+            }
+            catch {
+              Write-Host "  no version index for $packageId"
+            }
+            $versionCache[$lowerId] = $versions
+            return $versions
+          }
 
-                $fileName = ("$($item.publisher)_$($item.name)_$(if ($versionText) { $versionText } else { $item.version }).app").Split($invalidChars) -join ''
-                $candidateFile = Join-Path $symbolsFolder $fileName
+          function ConvertTo-ComparableVersion {
+            param([string] $text)
+            # Platform versions are 3-part, app versions 4-part - pad so they compare
+            $parts = @($text.Split('.') | Where-Object { $_ -match '^\d+$' })
+            while ($parts.Count -lt 4) { $parts += '0' }
+            return [System.Version]::Parse(($parts[0..3] -join '.'))
+          }
 
-                try {
-                  $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $candidateFile -PassThru
-                  $targetFile = $candidateFile
-                  $usedVersion = $versionText
-                  if (!$usedVersion) { $usedVersion = '(resolved by the environment)' }
-                  $workingForm = $form.label
+          function Select-FeedVersion {
+            param([string[]] $versions, [string] $wanted)
+            # The feed publishes one build per minor release, so the exact build an
+            # environment reports is often absent. Widen the match instead of failing:
+            # exact -> highest with the same major.minor -> highest with the same major.
+            if ($versions.Count -eq 0) { return '' }
+            $ordered = @($versions | Sort-Object -Property @{ Expression = { ConvertTo-ComparableVersion $_ } } -Descending)
+            if (!$wanted) { return $ordered[0] }
 
-                  # The response tells us which version was really served - use it for the file name
-                  try {
-                    if ($response -and $response.Headers.ContainsKey('Content-Disposition')) {
-                      $match = [regex]::Match(($response.Headers['Content-Disposition'] -join ';'), 'filename[^=]*=\s*"?([^";]+)"?')
-                      if ($match.Success) {
-                        $realName = $match.Groups[1].Value.Trim().Trim('"')
-                        if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
-                        $realName = ([System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))).Split($invalidChars) -join ''
-                        if ($realName -and $realName -ne $fileName) {
-                          Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
-                          $targetFile = Join-Path $symbolsFolder $realName
-                        }
-                      }
-                    }
-                  }
-                  catch {
-                    Write-Host "  could not read the file name from the response - keeping $fileName"
-                  }
-                  break
-                }
-                catch {
-                  if (Test-Path $candidateFile) { Remove-Item $candidateFile -Force }
-                  $statusCode = ''
-                  try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                  # The response body carries the actual reason - without it a 500 is unreadable
-                  $body = ''
-                  try {
-                    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                      $body = ($_.ErrorDetails.Message -replace '\s+', ' ').Trim()
-                      if ($body.Length -gt 300) { $body = $body.Substring(0, 300) + '...' }
-                    }
-                  } catch {}
-                  $shownVersion = if ($versionText) { $versionText } else { 'no version' }
-                  Write-Host "  $($item.name) [$($form.label)] $shownVersion -> HTTP $statusCode $body"
-                  $lastError = "HTTP $statusCode"
-                  if ($body) { $lastError = "HTTP $statusCode - $body" }
-                  if ($statusCode -in @(401, 403)) { $permissionDenied = $true; break }
+            $wantedVersion = ConvertTo-ComparableVersion $wanted
+            $match = $ordered | Where-Object { (ConvertTo-ComparableVersion $_) -eq $wantedVersion } | Select-Object -First 1
+            if ($match) { return $match }
+            $match = $ordered | Where-Object {
+              $v = ConvertTo-ComparableVersion $_
+              $v.Major -eq $wantedVersion.Major -and $v.Minor -eq $wantedVersion.Minor
+            } | Select-Object -First 1
+            if ($match) { return $match }
+            $match = $ordered | Where-Object { (ConvertTo-ComparableVersion $_).Major -eq $wantedVersion.Major } | Select-Object -First 1
+            if ($match) { return $match }
+            return ''
+          }
+
+          $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          function Save-SymbolPackage {
+            param([string] $packageId, [string] $version, [string] $folder)
+            # A symbol package is a zip holding the symbols-only .app - extract that so the
+            # folder can be handed to the compiler as .alpackages directly
+            $lowerId = $packageId.ToLowerInvariant()
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "$lowerId.$version.nupkg"
+            $extracted = @()
+            try {
+              Invoke-WebRequest -Uri "$packageBase$lowerId/$version/$lowerId.$version.nupkg" -OutFile $tempFile -UseBasicParsing
+              $zip = [System.IO.Compression.ZipFile]::OpenRead($tempFile)
+              try {
+                foreach($entry in $zip.Entries) {
+                  if ([System.IO.Path]::GetExtension($entry.Name) -ne '.app') { continue }
+                  $fileName = ($entry.Name.Split($invalidChars) -join '')
+                  $target = Join-Path $folder $fileName
+                  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                  $extracted += $target
                 }
               }
-              if ($targetFile -or $permissionDenied) { break }
+              finally { $zip.Dispose() }
+            }
+            finally { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+            return $extracted
+          }
+
+          # --- 5. Download two sets: the version on the environment, and the latest ---
+          $currentResults = @()
+          $latestResults = @()
+          $failed = @()
+
+          foreach($item in $toDownload) {
+            $candidates = @(Get-PackageIdCandidates -name $item.name -appId $item.appId)
+            $packageId = ''
+            $versions = @()
+            foreach($candidate in $candidates) {
+              $versions = @(Get-PackageVersions -packageId $candidate)
+              if ($versions.Count -gt 0) { $packageId = $candidate; break }
+            }
+            if (!$packageId) {
+              Write-Host "::warning::No symbol package on the feed for $($item.name) [$($item.appId)] - skipped."
+              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = 'not published on the MSSymbols feed' }
+              continue
             }
 
-            if ($targetFile) {
-              $sizeMb = [Math]::Round((Get-Item $targetFile).Length / 1MB, 2)
-              $note = ''
-              if ($usedVersion -ne $item.version) { $note = " (installed version $($item.version) is not published, asked for $usedVersion)" }
-              Write-Host "$($item.name) -> $([System.IO.Path]::GetFileName($targetFile)) ($sizeMb MB)$note"
-              $downloaded += [PSCustomObject]@{ name = $item.name; version = $item.version; requested = $usedVersion; file = [System.IO.Path]::GetFileName($targetFile); sizeMb = $sizeMb }
-            }
-            else {
-              Write-Host "::warning::Could not download $($item.name) - $lastError"
-              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = $lastError }
+            $currentVersion = Select-FeedVersion -versions $versions -wanted $item.version
+            $latestVersion = Select-FeedVersion -versions $versions -wanted ''
+            Write-Host "$($item.name) -> $packageId"
+            Write-Host "  on $environmentName : $($item.version) -> feed $currentVersion"
+            Write-Host "  latest              : $latestVersion"
+
+            foreach($target in @(
+                [PSCustomObject]@{ label = 'current'; version = $currentVersion; folder = $currentFolder },
+                [PSCustomObject]@{ label = 'latest';  version = $latestVersion;  folder = $latestFolder })) {
+
+              if (!$target.version) {
+                Write-Host "::warning::$($item.name) has no $($target.label) version on the feed - skipped."
+                $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "no $($target.label) version on the feed" }
+                continue
+              }
+              try {
+                $files = @(Save-SymbolPackage -packageId $packageId -version $target.version -folder $target.folder)
+                if ($files.Count -eq 0) { throw "the package contains no .app file" }
+                foreach($file in $files) {
+                  $sizeMb = [Math]::Round((Get-Item $file).Length / 1MB, 2)
+                  $record = [PSCustomObject]@{
+                    name      = $item.name
+                    onEnv     = $item.version
+                    version   = $target.version
+                    packageId = $packageId
+                    file      = [System.IO.Path]::GetFileName($file)
+                    sizeMb    = $sizeMb
+                  }
+                  if ($target.label -eq 'current') { $currentResults += $record } else { $latestResults += $record }
+                  Write-Host "  [$($target.label)] $([System.IO.Path]::GetFileName($file)) ($sizeMb MB)"
+                }
+              }
+              catch {
+                $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                Write-Host "::warning::Could not download $packageId $($target.version) ($($target.label)) - $reason"
+                $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "$($target.label) $($target.version): $reason" }
+              }
             }
           }
 
-          if ($downloaded.Count -eq 0) {
-            Write-Host "::error::No symbols could be downloaded from $environmentName. If every attempt returned HTTP 500, the development endpoint is most likely not serving this environment - sandbox environments have it open by default, production environments do not. Fall back to downloading the Microsoft symbols from BC artifacts (Get-BCArtifactUrl / Download-Artifacts) at version $($env:applicationVersion)."
-            throw "No symbols could be downloaded from $environmentName."
+          if ($currentResults.Count -eq 0 -and $latestResults.Count -eq 0) {
+            throw "No symbols could be downloaded from the MSSymbols feed."
           }
-          Write-Host "Downloaded $($downloaded.Count) symbol package(s) to $symbolsFolder"
+          Write-Host "Downloaded $($currentResults.Count) current + $($latestResults.Count) latest symbol package(s)"
 
           # --- Outputs ---
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolCount=$($downloaded.Count)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolCount=$($currentResults.Count)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "latestSymbolCount=$($latestResults.Count)"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "skippedCount=$($skipped.Count + $failed.Count)"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolsFolder=$symbolsFolder"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolsFolder=$currentFolder"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "currentSymbolsFolder=$currentFolder"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "latestSymbolsFolder=$latestFolder"
 
           # --- Note file, shipped inside the artifact ---
-          $noteFile = Join-Path $symbolsFolder 'symbols.txt'
-          Set-Content -Encoding UTF8 -Path $noteFile -Value "Symbols downloaded from $environmentName"
-          foreach($item in $downloaded) {
-            Add-Content -Encoding UTF8 -Path $noteFile -Value "downloaded;$($item.name);$($item.version);$($item.requested);$($item.file)"
+          $noteFile = Join-Path $rootFolder 'symbols.txt'
+          Set-Content -Encoding UTF8 -Path $noteFile -Value "Symbols downloaded from the MSSymbols NuGet feed (localization $country)"
+          foreach($item in $currentResults) {
+            Add-Content -Encoding UTF8 -Path $noteFile -Value "current;$($item.name);$($item.onEnv);$($item.version);$($item.packageId);$($item.file)"
+          }
+          foreach($item in $latestResults) {
+            Add-Content -Encoding UTF8 -Path $noteFile -Value "latest;$($item.name);;$($item.version);$($item.packageId);$($item.file)"
           }
           foreach($item in ($skipped + $failed)) {
             Add-Content -Encoding UTF8 -Path $noteFile -Value "skipped;$($item.name);$($item.declaredVersion);$($item.reason)"
@@ -621,10 +720,15 @@ jobs:
           Write-Host "Wrote $noteFile"
 
           # --- Job summary ---
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols from $environmentName ($($downloaded.Count))`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed on TEST | Requested | File | Size (MB) |`n| --- | --- | --- | --- | --- |"
-          foreach($item in $downloaded) {
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.requested) | $($item.file) | $($item.sizeMb) |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols on $environmentName ($($currentResults.Count))`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed on TEST | Feed version | Package | File | Size (MB) |`n| --- | --- | --- | --- | --- | --- |"
+          foreach($item in $currentResults) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.onEnv) | $($item.version) | $($item.packageId) | $($item.file) | $($item.sizeMb) |"
+          }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols at the latest version ($($latestResults.Count))`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Feed version | Package | File | Size (MB) |`n| --- | --- | --- | --- | --- |"
+          foreach($item in $latestResults) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.packageId) | $($item.file) | $($item.sizeMb) |"
           }
           if (($skipped.Count + $failed.Count) -gt 0) {
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Skipped ($($skipped.Count + $failed.Count))`n"
