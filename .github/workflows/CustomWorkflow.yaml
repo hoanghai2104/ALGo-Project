@@ -107,6 +107,11 @@ jobs:
           }
           $token = (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $body -ContentType 'application/x-www-form-urlencoded').access_token
 
+          # Make the token available to later steps in this job (masked so it can never be logged)
+          Write-Host "::add-mask::$token"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_ENV -Value "bcAccessToken=$token"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_ENV -Value "bcTenantId=$tenantId"
+
           # --- Current version of the PROD environment ---
           # Preferred: Admin Center API (gives both platform and application version).
           # Requires the Entra app to have the "AdminCenter.ReadWrite.All" application
@@ -371,8 +376,147 @@ jobs:
           # Your CreateSymbolPackage command here
           Write-Host "CreateSymbolPackage for BC ${{ steps.showEnvironment.outputs.applicationVersion }}"
 
-      - name: Create TempText File
+      - name: Download Symbols
+        id: downloadSymbols
+        shell: pwsh
+        env:
+          environmentName: ${{ steps.showEnvironment.outputs.environmentName }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $symbolsFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
+          New-Item -Path $symbolsFolder -ItemType Directory -Force | Out-Null
+
+          if (!$env:bcAccessToken) { throw "No access token available - the 'Show environment' step must run first." }
+          $headers = @{ Authorization = "Bearer $($env:bcAccessToken)" }
+          $devServerUrl = "https://api.businesscentral.dynamics.com/v2.0/$($env:environmentName)"
+          $tenant = $env:bcTenantId
+          Write-Host "Dev endpoint        : $devServerUrl/dev/packages"
+
+          # --- Build the list of symbols to download (Microsoft apps only) ---
+          $symbols = New-Object System.Collections.Generic.List[object]
+          $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+          function Add-Symbol {
+            param([string] $publisher, [string] $name, [string] $version, [string] $appId)
+            if (!$name -or !$version) { return }
+            if ($publisher -ne 'Microsoft') {
+              Write-Host "  skipping $publisher / $name (not published by Microsoft)"
+              return
+            }
+            if (!$seen.Add("$publisher|$name")) { return }
+            $symbols.Add([PSCustomObject]@{ publisher = $publisher; name = $name; version = $version; appId = $appId })
+          }
+
+          $excludedFolders = @('.alpackages', '.snapshots', '.git', 'node_modules', '.output', 'custom-output')
+          $appJsonFiles = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter 'app.json' -Recurse -File |
+            Where-Object {
+              $pathParts = $_.FullName.Split([char]'\', [char]'/')
+              -not ($pathParts | Where-Object { $excludedFolders -contains $_ })
+            })
+
+          foreach($appJsonFile in $appJsonFiles) {
+            $app = Get-Content -Path $appJsonFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            Write-Host "=== $($app.name) $($app.version) ==="
+            # "platform" -> Microsoft/System, "application" -> Microsoft/Application + Base Application
+            if ($app.PSObject.Properties.Name -contains 'platform' -and $app.platform) {
+              Add-Symbol -publisher 'Microsoft' -name 'System' -version $app.platform -appId '8874ed3a-0643-4247-9ced-7a7002f7135d'
+            }
+            if ($app.PSObject.Properties.Name -contains 'application' -and $app.application) {
+              Add-Symbol -publisher 'Microsoft' -name 'Application' -version $app.application -appId 'c1335042-3002-4257-bf8a-75c898ccb1b8'
+              Add-Symbol -publisher 'Microsoft' -name 'Base Application' -version $app.application -appId ''
+            }
+            # explicit dependencies from app.json
+            if ($app.PSObject.Properties.Name -contains 'dependencies' -and $app.dependencies) {
+              foreach($dependency in @($app.dependencies)) {
+                $appId = ''
+                foreach($idName in @('id','appId')) {
+                  if ($dependency.PSObject.Properties.Name -contains $idName -and $dependency."$idName") { $appId = $dependency."$idName"; break }
+                }
+                Add-Symbol -publisher $dependency.publisher -name $dependency.name -version $dependency.version -appId $appId
+              }
+            }
+          }
+          Write-Host "Symbols to download : $($symbols.Count)"
+
+          # --- Download each symbol package from the environment ---
+          $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+          $downloaded = @()
+          $failed = @()
+          foreach($symbol in $symbols) {
+            $fileName = ("$($symbol.publisher)_$($symbol.name)_$($symbol.version).app").Split($invalidChars) -join ''
+            $targetFile = Join-Path $symbolsFolder $fileName
+
+            if ($symbol.appId) {
+              $url = "$devServerUrl/dev/packages?appId=$($symbol.appId)&versionText=$($symbol.version)&tenant=$tenant"
+            }
+            else {
+              $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($symbol.publisher))&appName=$([uri]::EscapeDataString($symbol.name))&versionText=$($symbol.version)&tenant=$tenant"
+            }
+
+            Write-Host "Downloading $($symbol.publisher) / $($symbol.name) $($symbol.version)"
+            try {
+              $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $targetFile -PassThru
+
+              # Prefer the file name the endpoint reports - it carries the real installed version
+              try {
+                if ($response.Headers.ContainsKey('Content-Disposition')) {
+                  $disposition = ($response.Headers['Content-Disposition'] -join ';')
+                  $match = [regex]::Match($disposition, 'filename[^=]*=\s*"?([^";]+)"?')
+                  if ($match.Success) {
+                    $realName = $match.Groups[1].Value.Trim().Trim('"')
+                    if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
+                    $realName = [System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))
+                    $realName = $realName.Split($invalidChars) -join ''
+                    if ($realName -and $realName -ne $fileName) {
+                      Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
+                      $fileName = $realName
+                      $targetFile = Join-Path $symbolsFolder $realName
+                    }
+                  }
+                }
+              }
+              catch {
+                Write-Host "  could not read the file name from the response - keeping $fileName"
+              }
+
+              $sizeMb = [Math]::Round((Get-Item $targetFile).Length / 1MB, 2)
+              Write-Host "  -> $fileName ($sizeMb MB)"
+              $downloaded += [PSCustomObject]@{ name = $symbol.name; file = $fileName; sizeMb = $sizeMb }
+            }
+            catch {
+              if (Test-Path $targetFile) { Remove-Item $targetFile -Force }
+              $statusCode = ''
+              try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+              $reason = "it is probably not installed on $($env:environmentName)"
+              if ($statusCode -in @(401, 403)) { $reason = "the Entra app lacks access to the development endpoint of $($env:environmentName)" }
+              Write-Host "::warning::Could not download $($symbol.publisher) / $($symbol.name) $($symbol.version) (HTTP $statusCode) - $reason."
+              $failed += "$($symbol.publisher) / $($symbol.name) $($symbol.version) (HTTP $statusCode)"
+            }
+          }
+
+          if ($downloaded.Count -eq 0) {
+            throw "No symbols could be downloaded from $($env:environmentName). Check that the Entra app is registered in the environment with the D365 EXTENSION MGT permission set."
+          }
+          Write-Host "Downloaded $($downloaded.Count) of $($symbols.Count) symbol packages to $symbolsFolder"
+
+          # --- Outputs / summary ---
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolCount=$($downloaded.Count)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "symbolsFolder=$symbolsFolder"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols downloaded from $($env:environmentName) ($($downloaded.Count))`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | File | Size (MB) |`n| --- | --- | --- |"
+          foreach($item in $downloaded) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.file) | $($item.sizeMb) |"
+          }
+          if ($failed.Count -gt 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`nNot downloaded:`n"
+            foreach($item in $failed) {
+              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "- $item"
+            }
+          }
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: temp-text
+          name: custom-artifacts
           path: custom-output/customArtifacts/
