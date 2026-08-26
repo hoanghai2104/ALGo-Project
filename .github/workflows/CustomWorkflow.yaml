@@ -468,7 +468,7 @@ jobs:
                   $systemVersion = $item.declaredVersion
                   Write-Host "::warning::Platform version of $environmentName is unknown (Admin Center API was not available) - requesting System symbols with the app.json version $systemVersion instead."
                 }
-                $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = 'System'; version = $systemVersion; appId = $item.appId }
+                $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = 'System'; version = $systemVersion; declaredVersion = $item.declaredVersion; appId = $item.appId }
               }
               else {
                 Write-Host "::warning::$($item.name) is not installed on $environmentName - skipped."
@@ -487,7 +487,7 @@ jobs:
             if ($item.declaredVersion -and ([System.Version]$installedVersion -lt [System.Version]$item.declaredVersion)) {
               Write-Host "::warning::$($item.name) is $installedVersion on $environmentName but app.json requires $($item.declaredVersion) - downloading the installed version, the build will not be able to satisfy the dependency."
             }
-            $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = $item.name; version = $installedVersion; appId = "$($installedApp.id)" }
+            $toDownload += [PSCustomObject]@{ publisher = 'Microsoft'; name = $item.name; version = $installedVersion; declaredVersion = $item.declaredVersion; appId = "$($installedApp.id)" }
           }
           Write-Host "To download         : $($toDownload.Count) (skipped $($skipped.Count))"
 
@@ -496,30 +496,79 @@ jobs:
           $downloaded = @()
           $failed = @()
           foreach($item in $toDownload) {
-            $fileName = ("$($item.publisher)_$($item.name)_$($item.version).app").Split($invalidChars) -join ''
-            $targetFile = Join-Path $symbolsFolder $fileName
-            if ($item.appId) {
-              $url = "$devServerUrl/dev/packages?appId=$($item.appId)&versionText=$($item.version)&tenant=$tenant"
-            }
-            else {
-              $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&versionText=$($item.version)&tenant=$tenant"
+            # The dev endpoint can only serve versions it has actually published. The version
+            # installed on the environment is not always one of them (it answers HTTP 500 in that
+            # case), so fall back to less specific versions until one of them is accepted.
+            $versionCandidates = @()
+            foreach($candidate in @($item.version, $item.declaredVersion, "$(([System.Version]$item.version).Major).0.0.0", '')) {
+              if ($versionCandidates -notcontains $candidate) { $versionCandidates += $candidate }
             }
 
-            Write-Host "Downloading $($item.name) $($item.version)"
-            try {
-              Invoke-WebRequest -Uri $url -Headers $headers -OutFile $targetFile
-              $sizeMb = [Math]::Round((Get-Item $targetFile).Length / 1MB, 2)
-              Write-Host "  -> $fileName ($sizeMb MB)"
-              $downloaded += [PSCustomObject]@{ name = $item.name; version = $item.version; file = $fileName; sizeMb = $sizeMb }
+            $targetFile = ''
+            $usedVersion = ''
+            $lastError = ''
+            foreach($versionText in $versionCandidates) {
+              $fileName = ("$($item.publisher)_$($item.name)_$(if ($versionText) { $versionText } else { $item.version }).app").Split($invalidChars) -join ''
+              $candidateFile = Join-Path $symbolsFolder $fileName
+              if ($item.appId) {
+                $url = "$devServerUrl/dev/packages?appId=$($item.appId)&tenant=$tenant"
+              }
+              else {
+                $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&tenant=$tenant"
+              }
+              if ($versionText) { $url += "&versionText=$versionText" }
+
+              try {
+                $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $candidateFile -PassThru
+                $targetFile = $candidateFile
+                $usedVersion = $versionText
+                if (!$usedVersion) { $usedVersion = '(resolved by the environment)' }
+
+                # The response tells us which version was really served - use it for the file name
+                try {
+                  if ($response -and $response.Headers.ContainsKey('Content-Disposition')) {
+                    $match = [regex]::Match(($response.Headers['Content-Disposition'] -join ';'), 'filename[^=]*=\s*"?([^";]+)"?')
+                    if ($match.Success) {
+                      $realName = $match.Groups[1].Value.Trim().Trim('"')
+                      if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
+                      $realName = ([System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))).Split($invalidChars) -join ''
+                      if ($realName -and $realName -ne $fileName) {
+                        Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
+                        $fileName = $realName
+                        $targetFile = Join-Path $symbolsFolder $realName
+                      }
+                    }
+                  }
+                }
+                catch {
+                  Write-Host "  could not read the file name from the response - keeping $fileName"
+                }
+                break
+              }
+              catch {
+                if (Test-Path $candidateFile) { Remove-Item $candidateFile -Force }
+                $statusCode = ''
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                $lastError = "HTTP $statusCode"
+                if ($statusCode -in @(401, 403)) {
+                  $lastError = "HTTP $statusCode - the Entra app lacks access to the development endpoint of $environmentName"
+                  break
+                }
+                $shown = if ($versionText) { $versionText } else { 'no version' }
+                Write-Host "  $($item.name): $shown -> HTTP $statusCode, trying a less specific version"
+              }
             }
-            catch {
-              if (Test-Path $targetFile) { Remove-Item $targetFile -Force }
-              $statusCode = ''
-              try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-              $reason = "HTTP $statusCode"
-              if ($statusCode -in @(401, 403)) { $reason = "HTTP $statusCode - the Entra app lacks access to the development endpoint of $environmentName" }
-              Write-Host "::warning::Could not download $($item.name) $($item.version) ($reason)."
-              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = $reason }
+
+            if ($targetFile) {
+              $sizeMb = [Math]::Round((Get-Item $targetFile).Length / 1MB, 2)
+              $note = ''
+              if ($usedVersion -ne $item.version) { $note = " (installed version $($item.version) is not published, asked for $usedVersion)" }
+              Write-Host "$($item.name) -> $([System.IO.Path]::GetFileName($targetFile)) ($sizeMb MB)$note"
+              $downloaded += [PSCustomObject]@{ name = $item.name; version = $item.version; requested = $usedVersion; file = [System.IO.Path]::GetFileName($targetFile); sizeMb = $sizeMb }
+            }
+            else {
+              Write-Host "::warning::Could not download $($item.name) - no version accepted by $environmentName ($lastError)."
+              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = "no version accepted ($lastError)" }
             }
           }
 
@@ -537,7 +586,7 @@ jobs:
           $noteFile = Join-Path $symbolsFolder 'symbols.txt'
           Set-Content -Encoding UTF8 -Path $noteFile -Value "Symbols downloaded from $environmentName"
           foreach($item in $downloaded) {
-            Add-Content -Encoding UTF8 -Path $noteFile -Value "downloaded;$($item.name);$($item.version);$($item.file)"
+            Add-Content -Encoding UTF8 -Path $noteFile -Value "downloaded;$($item.name);$($item.version);$($item.requested);$($item.file)"
           }
           foreach($item in ($skipped + $failed)) {
             Add-Content -Encoding UTF8 -Path $noteFile -Value "skipped;$($item.name);$($item.declaredVersion);$($item.reason)"
@@ -546,9 +595,9 @@ jobs:
 
           # --- Job summary ---
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols from $environmentName ($($downloaded.Count))`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed version | File | Size (MB) |`n| --- | --- | --- | --- |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Installed on PROD | Requested | File | Size (MB) |`n| --- | --- | --- | --- | --- |"
           foreach($item in $downloaded) {
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.file) | $($item.sizeMb) |"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.version) | $($item.requested) | $($item.file) | $($item.sizeMb) |"
           }
           if (($skipped.Count + $failed.Count) -gt 0) {
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Skipped ($($skipped.Count + $failed.Count))`n"
