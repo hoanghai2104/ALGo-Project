@@ -3,6 +3,8 @@
   "artifact": "////nextminor",
   "cacheImageName": "",
   "versioningStrategy": 15,
-  "workflowSchedule": { "cron": "0 3 * * 1" },
+  "workflowSchedule": {
+    "cron": "0 3 * * 1"
+  },
   "failOn": "error"
 }
