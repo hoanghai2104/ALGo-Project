@@ -382,6 +382,7 @@ jobs:
         env:
           environmentName: ${{ steps.showEnvironment.outputs.environmentName }}
           platformVersion: ${{ steps.showEnvironment.outputs.platformVersion }}
+          applicationVersion: ${{ steps.showEnvironment.outputs.applicationVersion }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -495,68 +496,93 @@ jobs:
           $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
           $downloaded = @()
           $failed = @()
+          # The dev endpoint is addressable in two documented shapes, and it only serves
+          # versions it has actually published (answering HTTP 500 otherwise). Try both shapes
+          # against progressively less specific versions, and log the response body of every
+          # failure - that body is what says whether the problem is the version, the URL or
+          # the environment refusing development access at all.
+          $urlForms = @(
+            [PSCustomObject]@{ label = 'environment'; url = "https://api.businesscentral.dynamics.com/v2.0/$environmentName/dev/packages" },
+            [PSCustomObject]@{ label = 'tenant+environment'; url = "https://api.businesscentral.dynamics.com/v2.0/$tenant/$environmentName/dev/packages" }
+          )
+          $workingForm = ''
+
           foreach($item in $toDownload) {
-            # The dev endpoint can only serve versions it has actually published. The version
-            # installed on the environment is not always one of them (it answers HTTP 500 in that
-            # case), so fall back to less specific versions until one of them is accepted.
             $versionCandidates = @()
             foreach($candidate in @($item.version, $item.declaredVersion, "$(([System.Version]$item.version).Major).0.0.0", '')) {
               if ($versionCandidates -notcontains $candidate) { $versionCandidates += $candidate }
             }
 
+            # Once one shape works, keep using it instead of probing again for every app
+            $formsToTry = $urlForms
+            if ($workingForm) { $formsToTry = @($urlForms | Where-Object { $_.label -eq $workingForm }) }
+
             $targetFile = ''
             $usedVersion = ''
             $lastError = ''
-            foreach($versionText in $versionCandidates) {
-              $fileName = ("$($item.publisher)_$($item.name)_$(if ($versionText) { $versionText } else { $item.version }).app").Split($invalidChars) -join ''
-              $candidateFile = Join-Path $symbolsFolder $fileName
-              if ($item.appId) {
-                $url = "$devServerUrl/dev/packages?appId=$($item.appId)&tenant=$tenant"
-              }
-              else {
-                $url = "$devServerUrl/dev/packages?publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&tenant=$tenant"
-              }
-              if ($versionText) { $url += "&versionText=$versionText" }
+            $permissionDenied = $false
 
-              try {
-                $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $candidateFile -PassThru
-                $targetFile = $candidateFile
-                $usedVersion = $versionText
-                if (!$usedVersion) { $usedVersion = '(resolved by the environment)' }
+            foreach($form in $formsToTry) {
+              foreach($versionText in $versionCandidates) {
+                if ($item.appId) {
+                  $query = "appId=$($item.appId)&tenant=$tenant"
+                }
+                else {
+                  $query = "publisher=$([uri]::EscapeDataString($item.publisher))&appName=$([uri]::EscapeDataString($item.name))&tenant=$tenant"
+                }
+                if ($versionText) { $query += "&versionText=$versionText" }
+                $url = "$($form.url)?$query"
 
-                # The response tells us which version was really served - use it for the file name
+                $fileName = ("$($item.publisher)_$($item.name)_$(if ($versionText) { $versionText } else { $item.version }).app").Split($invalidChars) -join ''
+                $candidateFile = Join-Path $symbolsFolder $fileName
+
                 try {
-                  if ($response -and $response.Headers.ContainsKey('Content-Disposition')) {
-                    $match = [regex]::Match(($response.Headers['Content-Disposition'] -join ';'), 'filename[^=]*=\s*"?([^";]+)"?')
-                    if ($match.Success) {
-                      $realName = $match.Groups[1].Value.Trim().Trim('"')
-                      if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
-                      $realName = ([System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))).Split($invalidChars) -join ''
-                      if ($realName -and $realName -ne $fileName) {
-                        Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
-                        $fileName = $realName
-                        $targetFile = Join-Path $symbolsFolder $realName
+                  $response = Invoke-WebRequest -Uri $url -Headers $headers -OutFile $candidateFile -PassThru
+                  $targetFile = $candidateFile
+                  $usedVersion = $versionText
+                  if (!$usedVersion) { $usedVersion = '(resolved by the environment)' }
+                  $workingForm = $form.label
+
+                  # The response tells us which version was really served - use it for the file name
+                  try {
+                    if ($response -and $response.Headers.ContainsKey('Content-Disposition')) {
+                      $match = [regex]::Match(($response.Headers['Content-Disposition'] -join ';'), 'filename[^=]*=\s*"?([^";]+)"?')
+                      if ($match.Success) {
+                        $realName = $match.Groups[1].Value.Trim().Trim('"')
+                        if ($realName -match "^UTF-8''(.+)$") { $realName = $matches[1] }
+                        $realName = ([System.IO.Path]::GetFileName([uri]::UnescapeDataString($realName))).Split($invalidChars) -join ''
+                        if ($realName -and $realName -ne $fileName) {
+                          Move-Item -Path $targetFile -Destination (Join-Path $symbolsFolder $realName) -Force
+                          $targetFile = Join-Path $symbolsFolder $realName
+                        }
                       }
                     }
                   }
-                }
-                catch {
-                  Write-Host "  could not read the file name from the response - keeping $fileName"
-                }
-                break
-              }
-              catch {
-                if (Test-Path $candidateFile) { Remove-Item $candidateFile -Force }
-                $statusCode = ''
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                $lastError = "HTTP $statusCode"
-                if ($statusCode -in @(401, 403)) {
-                  $lastError = "HTTP $statusCode - the Entra app lacks access to the development endpoint of $environmentName"
+                  catch {
+                    Write-Host "  could not read the file name from the response - keeping $fileName"
+                  }
                   break
                 }
-                $shown = if ($versionText) { $versionText } else { 'no version' }
-                Write-Host "  $($item.name): $shown -> HTTP $statusCode, trying a less specific version"
+                catch {
+                  if (Test-Path $candidateFile) { Remove-Item $candidateFile -Force }
+                  $statusCode = ''
+                  try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                  # The response body carries the actual reason - without it a 500 is unreadable
+                  $body = ''
+                  try {
+                    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                      $body = ($_.ErrorDetails.Message -replace '\s+', ' ').Trim()
+                      if ($body.Length -gt 300) { $body = $body.Substring(0, 300) + '...' }
+                    }
+                  } catch {}
+                  $shownVersion = if ($versionText) { $versionText } else { 'no version' }
+                  Write-Host "  $($item.name) [$($form.label)] $shownVersion -> HTTP $statusCode $body"
+                  $lastError = "HTTP $statusCode"
+                  if ($body) { $lastError = "HTTP $statusCode - $body" }
+                  if ($statusCode -in @(401, 403)) { $permissionDenied = $true; break }
+                }
               }
+              if ($targetFile -or $permissionDenied) { break }
             }
 
             if ($targetFile) {
@@ -567,13 +593,14 @@ jobs:
               $downloaded += [PSCustomObject]@{ name = $item.name; version = $item.version; requested = $usedVersion; file = [System.IO.Path]::GetFileName($targetFile); sizeMb = $sizeMb }
             }
             else {
-              Write-Host "::warning::Could not download $($item.name) - no version accepted by $environmentName ($lastError)."
-              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = "no version accepted ($lastError)" }
+              Write-Host "::warning::Could not download $($item.name) - $lastError"
+              $failed += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.version; reason = $lastError }
             }
           }
 
           if ($downloaded.Count -eq 0) {
-            throw "No symbols could be downloaded from $environmentName. Check that the Entra app is registered in the environment with the D365 EXTENSION MGT permission set."
+            Write-Host "::error::No symbols could be downloaded from $environmentName. If every attempt returned HTTP 500, the development endpoint is most likely not serving this environment - sandbox environments have it open by default, production environments do not. Fall back to downloading the Microsoft symbols from BC artifacts (Get-BCArtifactUrl / Download-Artifacts) at version $($env:applicationVersion)."
+            throw "No symbols could be downloaded from $environmentName."
           }
           Write-Host "Downloaded $($downloaded.Count) symbol package(s) to $symbolsFolder"
 
