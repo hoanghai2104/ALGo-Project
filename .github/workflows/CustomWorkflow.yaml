@@ -77,17 +77,48 @@ jobs:
             throw "No AuthContext secret found for environment PROD. Expected ALGOPROJECTAPPPROD_AUTHCONTEXT (see .github/AL-Go-Settings.json)."
           }
 
-          # --- BcContainerHelper (via AL-Go helper) ---
-          $ALGoHelperPath = "$([System.IO.Path]::GetTempFileName()).ps1"
-          (New-Object System.Net.WebClient).DownloadFile('https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v9.2/AL-Go-Helper.ps1', $ALGoHelperPath)
-          . $ALGoHelperPath
-          DownloadAndImportBcContainerHelper
+          # --- Get an access token for the BC Admin Center API ---
+          $authContext = $authContextJson | ConvertFrom-Json
+          function Get-Value([object] $obj, [string[]] $names) {
+            foreach($name in $names) {
+              if ($obj.PSObject.Properties.Name -contains $name -and $obj."$name") { return $obj."$name" }
+            }
+            return $null
+          }
+          $tenantId     = Get-Value $authContext @('TenantId','tenantID','tenant')
+          $clientId     = Get-Value $authContext @('ClientId','clientID')
+          $clientSecret = Get-Value $authContext @('ClientSecret')
+          $refreshToken = Get-Value $authContext @('RefreshToken')
+          if (!$tenantId -or !$clientId) {
+            throw "AuthContext secret must contain TenantId and ClientId."
+          }
 
-          $authContextParams = $authContextJson | ConvertFrom-Json | ConvertTo-HashTable
-          $bcAuthContext = New-BcAuthContext @authContextParams
+          $scope = 'https://api.businesscentral.dynamics.com/.default'
+          if ($clientSecret) {
+            Write-Host "Authenticating with client credentials (tenant $tenantId)"
+            $body = @{ grant_type = 'client_credentials'; client_id = $clientId; client_secret = $clientSecret; scope = $scope }
+          }
+          elseif ($refreshToken) {
+            Write-Host "Authenticating with refresh token (tenant $tenantId)"
+            $body = @{ grant_type = 'refresh_token'; client_id = $clientId; refresh_token = $refreshToken; scope = "$scope offline_access" }
+          }
+          else {
+            throw "AuthContext secret must contain either ClientSecret or RefreshToken."
+          }
+          $token = (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $body -ContentType 'application/x-www-form-urlencoded').access_token
 
           # --- Current version of the PROD environment ---
-          $bcEnvironment = Get-BcEnvironments -bcAuthContext $bcAuthContext | Where-Object { $_.name -eq $environmentName }
+          $adminApi = "https://api.businesscentral.dynamics.com/admin/v2.24/applications/BusinessCentral/environments"
+          try {
+            $bcEnvironments = (Invoke-RestMethod -Method Get -Uri $adminApi -Headers @{ Authorization = "Bearer $token" }).value
+          }
+          catch {
+            Write-Host "::error::Call to $adminApi failed: $($_.Exception.Message)"
+            throw
+          }
+          Write-Host "Environments in tenant: $(($bcEnvironments | ForEach-Object { $_.name }) -join ', ')"
+
+          $bcEnvironment = $bcEnvironments | Where-Object { $_.name -eq $environmentName }
           if (!$bcEnvironment) {
             throw "Environment '$environmentName' not found in the tenant."
           }
