@@ -108,32 +108,80 @@ jobs:
           $token = (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $body -ContentType 'application/x-www-form-urlencoded').access_token
 
           # --- Current version of the PROD environment ---
+          # Preferred: Admin Center API (gives both platform and application version).
+          # Requires the Entra app to have the "AdminCenter.ReadWrite.All" application
+          # permission AND to be listed on "Authorized Microsoft Entra apps" in the BC
+          # admin center. Falls back to the Automation API (Base Application version)
+          # when that is not granted.
+          $headers = @{ Authorization = "Bearer $token" }
+          $environmentType = ''
+          $countryCode = ''
+          $status = ''
+          $applicationVersion = ''
+          $platformVersion = ''
+
           $adminApi = "https://api.businesscentral.dynamics.com/admin/v2.24/applications/BusinessCentral/environments"
           try {
-            $bcEnvironments = (Invoke-RestMethod -Method Get -Uri $adminApi -Headers @{ Authorization = "Bearer $token" }).value
+            $bcEnvironments = (Invoke-RestMethod -Method Get -Uri $adminApi -Headers $headers).value
+            Write-Host "Environments in tenant: $(($bcEnvironments | ForEach-Object { $_.name }) -join ', ')"
+            $bcEnvironment = $bcEnvironments | Where-Object { $_.name -eq $environmentName }
+            if (!$bcEnvironment) {
+              throw "Environment '$environmentName' not found in the tenant."
+            }
+            $environmentType = $bcEnvironment.type
+            $countryCode = $bcEnvironment.countryCode
+            $status = $bcEnvironment.status
+            $applicationVersion = $bcEnvironment.applicationVersion
+            $platformVersion = $bcEnvironment.platformVersion
+            Write-Host "Source              : Admin Center API"
           }
           catch {
-            Write-Host "::error::Call to $adminApi failed: $($_.Exception.Message)"
-            throw
+            $statusCode = ''
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            if ($statusCode -in @(401, 403)) {
+              Write-Host "::warning::Admin Center API returned $statusCode. The Entra app is missing the 'AdminCenter.ReadWrite.All' application permission or is not authorized in the BC admin center ('Authorized Microsoft Entra apps'). Falling back to the Automation API."
+            }
+            else {
+              Write-Host "::error::Call to $adminApi failed: $($_.Exception.Message)"
+              throw
+            }
+
+            # Fallback: Automation API inside the environment (needs Automation.ReadWrite.All
+            # + the app registered in the environment with D365 AUTOMATION / EXTEN. MGT. - ADMIN)
+            $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$tenantId/$environmentName/api/microsoft/automation/v2.0"
+            $companies = (Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value
+            if (!$companies) {
+              throw "No companies returned from $automationApi/companies"
+            }
+            $companyId = $companies[0].id
+            Write-Host "Company             : $($companies[0].name) ($companyId)"
+
+            $extensions = (Invoke-RestMethod -Method Get -Uri "$automationApi/companies($companyId)/extensions" -Headers $headers).value
+            foreach($displayName in @('Base Application','System Application')) {
+              $extension = $extensions | Where-Object { $_.displayName -eq $displayName } | Select-Object -First 1
+              if ($extension) {
+                $version = "$($extension.versionMajor).$($extension.versionMinor).$($extension.versionBuild).$($extension.versionRevision)"
+                if ($displayName -eq 'Base Application') { $applicationVersion = $version } else { $platformVersion = $version }
+                Write-Host "$displayName version: $version"
+              }
+            }
+            if (!$applicationVersion) {
+              throw "Could not determine the application version of environment '$environmentName'."
+            }
+            Write-Host "Source              : Automation API (platform version not available - shows System Application version)"
           }
-          Write-Host "Environments in tenant: $(($bcEnvironments | ForEach-Object { $_.name }) -join ', ')"
 
-          $bcEnvironment = $bcEnvironments | Where-Object { $_.name -eq $environmentName }
-          if (!$bcEnvironment) {
-            throw "Environment '$environmentName' not found in the tenant."
-          }
+          Write-Host "Type                : $environmentType"
+          Write-Host "Country             : $countryCode"
+          Write-Host "Status              : $status"
+          Write-Host "Application version : $applicationVersion"
+          Write-Host "Platform version    : $platformVersion"
 
-          Write-Host "Type                : $($bcEnvironment.type)"
-          Write-Host "Country             : $($bcEnvironment.countryCode)"
-          Write-Host "Status              : $($bcEnvironment.status)"
-          Write-Host "Application version : $($bcEnvironment.applicationVersion)"
-          Write-Host "Platform version    : $($bcEnvironment.platformVersion)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "environmentName=$environmentName"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "applicationVersion=$applicationVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$platformVersion"
 
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "environmentName=$($bcEnvironment.name)"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "applicationVersion=$($bcEnvironment.applicationVersion)"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$($bcEnvironment.platformVersion)"
-
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $($bcEnvironment.name) |`n| Type | $($bcEnvironment.type) |`n| Application version | $($bcEnvironment.applicationVersion) |`n| Platform version | $($bcEnvironment.platformVersion) |"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $environmentName |`n| Type | $environmentType |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |"
 
       - name: Generate Symbols
         shell: pwsh
