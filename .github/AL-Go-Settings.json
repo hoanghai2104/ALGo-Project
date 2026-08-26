@@ -2,12 +2,10 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v9.2/.Modules/settings.schema.json",
   "type": "PTE",
   "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
-  
   "trackALAlertsInGitHub": true,
   "enableCodeCop": true,
   "enableUICop": true,
   "failOn": "error",
-
   "environments": [
     "PROD",
     "TEST"
@@ -24,5 +22,6 @@
     "EnvironmentName": "Production",
     "continuousDeployment": false
   },
-  "PROD-AuthContextSecretName": "ALGOPROJECTAPPPROD_AUTHCONTEXT"
+  "PROD-AuthContextSecretName": "ALGOPROJECTAPPPROD_AUTHCONTEXT",
+  "templateSha": "b7dd1f32feb254e07086096e8970fba1187d9a6e"
 }
