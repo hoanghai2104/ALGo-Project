@@ -183,6 +183,96 @@ jobs:
 
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $environmentName |`n| Type | $environmentType |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |"
 
+      - name: Read dependencies
+        id: readDependencies
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $outputFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
+          New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
+
+          # All app.json files in the repo (skip symbol/package folders)
+          $excludedFolders = @('.alpackages', '.snapshots', '.git', 'node_modules', '.output')
+          $appJsonFiles = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter 'app.json' -Recurse -File |
+            Where-Object {
+              $pathParts = $_.FullName.Split([char]'\', [char]'/')
+              -not ($pathParts | Where-Object { $excludedFolders -contains $_ })
+            })
+          if (!$appJsonFiles) {
+            throw "No app.json found in the repository."
+          }
+
+          $dependencies = @()
+          foreach($appJsonFile in $appJsonFiles) {
+            $app = Get-Content -Path $appJsonFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $appFolder = $appJsonFile.Directory.FullName.Substring($env:GITHUB_WORKSPACE.Length).TrimStart('\','/')
+            Write-Host "=== $($app.name) $($app.version) by $($app.publisher) ($appFolder) ==="
+            Write-Host "  platform    : $($app.platform)"
+            Write-Host "  application : $($app.application)"
+
+            $appDependencies = @()
+            if ($app.PSObject.Properties.Name -contains 'dependencies' -and $app.dependencies) {
+              $appDependencies = @($app.dependencies)
+            }
+            if ($appDependencies.Count -eq 0) {
+              Write-Host "  dependencies: <none>"
+              continue
+            }
+            Write-Host "  dependencies:"
+            foreach($dependency in $appDependencies) {
+              # app.json uses "id" (new) or "appId" (older runtime versions)
+              $id = ''
+              foreach($name in @('id','appId')) {
+                if ($dependency.PSObject.Properties.Name -contains $name -and $dependency."$name") { $id = $dependency."$name"; break }
+              }
+              Write-Host "    - $($dependency.publisher) / $($dependency.name) $($dependency.version) [$id]"
+              $dependencies += [PSCustomObject]@{
+                app        = $app.name
+                id         = $id
+                name       = $dependency.name
+                publisher  = $dependency.publisher
+                version    = $dependency.version
+              }
+            }
+          }
+
+          Write-Host "Total dependencies: $($dependencies.Count)"
+
+          # --- Outputs for later steps ---
+          # ConvertTo-Json on an empty/single-item array does not produce a JSON array - force it
+          $dependenciesJson = '[]'
+          if ($dependencies.Count -gt 0) {
+            $dependenciesJson = ConvertTo-Json -InputObject @($dependencies) -Depth 5 -Compress
+          }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "dependencyCount=$($dependencies.Count)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "dependenciesJson=$dependenciesJson"
+
+          # --- Artifact file (picked up by the upload-artifact step) ---
+          $dependencyFile = Join-Path $outputFolder 'dependencies.txt'
+          Set-Content -Encoding UTF8 -Path $dependencyFile -Value "Dependencies for environment $('${{ steps.showEnvironment.outputs.environmentName }}') (application $('${{ steps.showEnvironment.outputs.applicationVersion }}'))"
+          if ($dependencies.Count -eq 0) {
+            Add-Content -Encoding UTF8 -Path $dependencyFile -Value "No dependencies declared."
+          }
+          else {
+            foreach($dependency in $dependencies) {
+              Add-Content -Encoding UTF8 -Path $dependencyFile -Value "$($dependency.app);$($dependency.publisher);$($dependency.name);$($dependency.version);$($dependency.id)"
+            }
+          }
+          Write-Host "Wrote $dependencyFile"
+
+          # --- Job summary ---
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Dependencies ($($dependencies.Count))`n"
+          if ($dependencies.Count -eq 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "No dependencies declared in app.json."
+          }
+          else {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Publisher | Dependency | Version |`n| --- | --- | --- | --- |"
+            foreach($dependency in $dependencies) {
+              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($dependency.app) | $($dependency.publisher) | $($dependency.name) | $($dependency.version) |"
+            }
+          }
+
       - name: Generate Symbols
         shell: pwsh
         run: |
