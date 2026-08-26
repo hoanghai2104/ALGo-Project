@@ -3,24 +3,112 @@ name: ' Custom Workflow'
 on:
   workflow_dispatch:
 
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+env:
+  ALGoOrgSettings: ${{ vars.ALGoOrgSettings }}
+  ALGoRepoSettings: ${{ vars.ALGoRepoSettings }}
+
 jobs:
   generate-symbols:
     runs-on: windows-latest
+
+    # Use the existing GitHub Environment (settings -> Environments) so its
+    # secrets/variables (e.g. ALGOPROJECTAPPPROD_AUTHCONTEXT) are available here
+    environment:
+      name: PROD
+
+    env:
+      ALGoEnvSettings: ${{ vars.ALGoEnvironmentSettings }}
+      ALGoEnvName: 'PROD'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read settings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: pwsh
+
+      - name: Read secrets
+        id: ReadSecrets
+        uses: microsoft/AL-Go-Actions/ReadSecrets@v9.2
+        with:
+          shell: pwsh
+          gitHubSecrets: ${{ toJson(secrets) }}
+          getSecrets: 'PROD-AuthContext,ALGOPROJECTAPPPROD_AUTHCONTEXT,AuthContext'
+
       - name: Show environment
+        id: showEnvironment
         shell: pwsh
+        env:
+          Secrets: ${{ steps.ReadSecrets.outputs.Secrets }}
         run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
           Write-Host "Running BC Symbol generation"
+
+          # --- Environment name from AL-Go settings (DeployToPROD.EnvironmentName) ---
+          $settings = $env:Settings | ConvertFrom-Json
+          $environmentName = 'Production'
+          if ($settings.PSObject.Properties.Name -contains 'DeployToPROD' -and $settings.DeployToPROD.EnvironmentName) {
+            $environmentName = $settings.DeployToPROD.EnvironmentName
+          }
+          Write-Host "GitHub environment : PROD"
+          Write-Host "BC environment     : $environmentName"
+
+          # --- AuthContext from the GitHub Environment secret ---
+          $secrets = $env:Secrets | ConvertFrom-Json
+          $authContextJson = $null
+          foreach($secretName in @('PROD-AuthContext','ALGOPROJECTAPPPROD_AUTHCONTEXT','AuthContext')) {
+            if (!$authContextJson -and $secrets.PSObject.Properties.Name -contains $secretName -and $secrets."$secretName") {
+              $value = $secrets."$secretName"
+              # ReadSecrets returns secret values base64 encoded - fall back to raw value
+              try { $value = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($value)) } catch {}
+              $authContextJson = $value
+              Write-Host "Using secret '$secretName' as AuthContext"
+            }
+          }
+          if (!$authContextJson) {
+            throw "No AuthContext secret found for environment PROD. Expected ALGOPROJECTAPPPROD_AUTHCONTEXT (see .github/AL-Go-Settings.json)."
+          }
+
+          # --- BcContainerHelper (via AL-Go helper) ---
+          $ALGoHelperPath = "$([System.IO.Path]::GetTempFileName()).ps1"
+          (New-Object System.Net.WebClient).DownloadFile('https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v9.2/AL-Go-Helper.ps1', $ALGoHelperPath)
+          . $ALGoHelperPath
+          DownloadAndImportBcContainerHelper
+
+          $authContextParams = $authContextJson | ConvertFrom-Json | ConvertTo-HashTable
+          $bcAuthContext = New-BcAuthContext @authContextParams
+
+          # --- Current version of the PROD environment ---
+          $bcEnvironment = Get-BcEnvironments -bcAuthContext $bcAuthContext | Where-Object { $_.name -eq $environmentName }
+          if (!$bcEnvironment) {
+            throw "Environment '$environmentName' not found in the tenant."
+          }
+
+          Write-Host "Type                : $($bcEnvironment.type)"
+          Write-Host "Country             : $($bcEnvironment.countryCode)"
+          Write-Host "Status              : $($bcEnvironment.status)"
+          Write-Host "Application version : $($bcEnvironment.applicationVersion)"
+          Write-Host "Platform version    : $($bcEnvironment.platformVersion)"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "environmentName=$($bcEnvironment.name)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "applicationVersion=$($bcEnvironment.applicationVersion)"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$($bcEnvironment.platformVersion)"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## PROD environment`n`n| Property | Value |`n| --- | --- |`n| Environment | $($bcEnvironment.name) |`n| Type | $($bcEnvironment.type) |`n| Application version | $($bcEnvironment.applicationVersion) |`n| Platform version | $($bcEnvironment.platformVersion) |"
 
       - name: Generate Symbols
         shell: pwsh
         run: |
           # Your CreateSymbolPackage command here
-          Write-Host "CreateSymbolPackage"
+          Write-Host "CreateSymbolPackage for BC ${{ steps.showEnvironment.outputs.applicationVersion }}"
 
       - name: Create TempText File
         uses: actions/upload-artifact@v4
