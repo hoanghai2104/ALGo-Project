@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="utf-8"?>
+<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+  <file datatype="xml" source-language="en-US" target-language="fr-FR" original="PhilippeMarechalELCA">
+    <body>
+      <group id="body">
+        <trans-unit id="Page 618246382 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Sales/Service Order Filter</source>
+          <target>Filtre des commandes vente/service</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - NamedType 121734379" size-unit="char" translate="yes" xml:space="preserve">
+          <source>The type must be Item.</source>
+          <target>Le type doit être Article.</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - NamedType ItemTypeRequiredErr</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - Control 4112877437 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Item Description</source>
+          <target>Description de l'article</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Control ItemDescription - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - Control 332802016 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Item No.</source>
+          <target>N° article</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Control ItemNo - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - Control 3483436672 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Sales Order Buffer Lookup</source>
+          <target>Recherche des commandes vente tampon</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Control SalesOrderBufferLookup - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - Control 554371971 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Service Order Buffer Lookup</source>
+          <target>Recherche des ordres de service tampon</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Control ServiceOrderBufferLookup - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 618246382 - Control 3996861631 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Source Type</source>
+          <target>Type de source</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Worksheet - Control SourceType - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="Page 1712738834 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Sales/Service Order Lookup</source>
+          <target>Recherche des commandes vente/service</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 1171137197 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Customer Name</source>
+          <target>Nom du client</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Customer Name - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 4190130733 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Customer No.</source>
+          <target>N° client</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Customer No. - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 486908828 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Document No.</source>
+          <target>N° commande source</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Document No. - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 2363328873 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Document Type</source>
+          <target>Type de commande</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Document Type - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 4059627918 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Intervention No.</source>
+          <target>N° de l’intervention</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Intervention No. - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 934633001 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Technician Name</source>
+          <target>Nom du technicien</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Technician Name - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Page 1712738834 - Control 705672093 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Tenant Name</source>
+          <target>Nom du locataire</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Page Sales/Service Order Lookup - Control Tenant Name - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 1481198915 - Control 3551756823 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Intervention No.</source>
+          <target>N° de l’intervention</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control No de intervention - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="PageExtension 1481198915 - Control 3406665897 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Customer Name</source>
+          <target>Nom du client</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control Phma Customer Name - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="PageExtension 1481198915 - Control 1691563319 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Source Document Order Type</source>
+          <target>Type de commande</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control Phma document order type - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="PageExtension 1481198915 - Control 2794880091 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Source Document Order No.</source>
+          <target>N° commande source</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control Phma source Document Order No - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="PageExtension 1481198915 - Control 4242208468 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Technician Name</source>
+          <target>Nom du technicien</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control Technitian Name - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="PageExtension 1481198915 - Control 3331875765 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 526152577">
+          <source>Tenant Name</source>
+          <target>Nom du locataire</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension Purch. Order Subform Ext. - Control TenantName - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="TableExtension 1575465679 - NamedType 469294250" size-unit="char" translate="yes" xml:space="preserve" al-object-target="TableExtension 1575465679">
+          <source>Purchase quantity (%1) cannot exceed the quantity (%2) for this item in %3: %4, Line No.: %5</source>
+          <target>La quantité à acheter (%1) ne peut pas dépasser la quantité (%2) pour cet article dans %3 : %4, n° de ligne : %5.</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">TableExtension PurchaseLine - NamedType PurchaseQuantityExceedsSourceDocumentErr</note>
+        </trans-unit>
+
+        <trans-unit id="ReportExtension 158195829 - NamedType 726693342" size-unit="char" translate="yes" xml:space="preserve" al-object-target="ReportExtension 158195829">
+          <source>This field limits the search to Sales/Service Orders only.</source>
+          <target>Ce champ limite la recherche aux commandes de vente/de service uniquement.</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">ReportExtension Calc. Plan - Req. Wksh. Ext. - NamedType SalesServiceOrderSearchLimitLbl</note>
+        </trans-unit>
+
+        <trans-unit id="ReportExtension 158195829 - Control 867431143 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Report 3238829205">
+          <source>To Order</source>
+          <target>À commander</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">ReportExtension Calc. Plan - Req. Wksh. Ext. - Control ToOrderFilter - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - Control 4225986076 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 2026081320">
+          <source>To Order</source>
+          <target>À commander</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - Control To Order PHM - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - Action 852268447 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 2026081320">
+          <source>To Order</source>
+          <target>À commander</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - Action To Order - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - Action 4128016460 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 2026081320">
+          <source>Disable selected lines</source>
+          <target>Désactiver les lignes sélectionnées</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - Action Disable selected lines - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - Action 656987487 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 2026081320">
+          <source>Enable selected lines</source>
+          <target>Activer les lignes sélectionnées</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - Action Enable selected lines - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - NamedType 2750203093" size-unit="char" translate="yes" xml:space="preserve" al-object-target="PageExtension 2223150926">
+          <source>No lines selected.</source>
+          <target>Aucune ligne sélectionnée.</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - NamedType NoLinesSelectedToPerformActionLbl</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - NamedType 3334634882" size-unit="char" translate="yes" xml:space="preserve" al-object-target="PageExtension 2223150926">
+          <source>No valid lines were found for update (line type must be "Item" and To Order must be "%1")</source>
+          <target>Aucune ligne valide n’a été trouvée pour la mise à jour (le type de ligne doit être « Article » et À commander doit être « %1 »).</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - NamedType NoValidLinesFoundLbl</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 2223150926 - NamedType 1279708777" size-unit="char" translate="yes" xml:space="preserve" al-object-target="PageExtension 2223150926">
+          <source>%1 of %2 selected lines have been updated.</source>
+          <target>%1 lignes sélectionnées sur %2 ont été mises à jour.</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension SalesOrderSub - NamedType SelectedLinesUpdatedLabel</note>
+        </trans-unit>
+
+        <trans-unit id="PageExtension 1476460220 - Control 4225986076 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Page 997019036">
+          <source>To Order</source>
+          <target>À commander</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">PageExtension ServiceLines - Control To Order PHM - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="Enum 4143576924 - EnumValue 1371923692 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source> </source>
+          <target> </target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Enum Requisition Wksh. To Order - EnumValue   - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Enum 4143576924 - EnumValue 949215307 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>No</source>
+          <target>Non</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Enum Requisition Wksh. To Order - EnumValue No - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Enum 4143576924 - EnumValue 1517371649 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Yes</source>
+          <target>Oui</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Enum Requisition Wksh. To Order - EnumValue Yes - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="Enum 2716620075 - EnumValue 1673401186 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Sales Order</source>
+          <target>Commande vente</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Enum Requisition Source Type - EnumValue Sales Order - Property Caption</note>
+        </trans-unit>
+        <trans-unit id="Enum 2716620075 - EnumValue 2145436509 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve">
+          <source>Service Order</source>
+          <target>Commande service</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Enum Requisition Source Type - EnumValue Service Order - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="Codeunit 4022340254 - NamedType 2250301153" size-unit="char" translate="yes" xml:space="preserve">
+          <source>The line type must be Item</source>
+          <target>Le type de ligne doit être Article</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">Codeunit RequisitionWorksheet - NamedType InvalidForNotItemTypeErr</note>
+        </trans-unit>
+
+        <trans-unit id="TableExtension 1814909561 - Field 346344467 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Table 1114148978">
+          <source>Total Quantity</source>
+          <target>Quantité totale</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">TableExtension SalesShipmentLineExt - Field Total Quantity - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="TableExtension 1575465679 - Field 3371451125 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Table 1519909599">
+          <source>Source Document Line No.</source>
+          <target>N° de ligne du document source</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">TableExtension PurchaseLine - Field Source Document Line No. - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="TableExtension 2479720606 - Field 1996078238 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Table 3610197182">
+          <source>To Invoice</source>
+          <target>À facturer</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">TableExtension ServiceHeader - Field To Invoice - Property Caption</note>
+        </trans-unit>
+
+        <trans-unit id="TableExtension 332033712 - Field 3054443502 - Property 2879900210" size-unit="char" translate="yes" xml:space="preserve" al-object-target="Table 1348940382">
+          <source>To Invoice</source>
+          <target>À facturer</target>
+          <note from="Developer" annotates="general" priority="2"></note>
+          <note from="Xliff Generator" annotates="general" priority="3">TableExtension FSWorkOrderintegration - Field ToInvoice - Property Caption</note>
+        </trans-unit>
+
+      </group>
+    </body>
+  </file>
+</xliff>

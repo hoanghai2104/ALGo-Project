@@ -1,5 +1,23 @@
 {
     "version": "0.2.0",
     "configurations": [
+        {
+            "name": "LocalSandbox",
+            "type": "al",
+            "request": "launch",
+            "environmentType": "Sandbox",
+            "environmentName": "Sandbox_ThangNT",
+            "tenant": "a58d8f6e-e1c0-44cd-b644-988251288504",
+            "startupObjectId": 22,
+            "startupObjectType": "Page",
+            "breakOnError": "All",
+            "breakOnRecordWrite": "None",
+            "launchBrowser": true,
+            "enableSqlInformationDebugger": true,
+            "enableLongRunningSqlStatements": true,
+            "longRunningSqlStatementsThreshold": 500,
+            "numberOfSqlStatements": 10,
+            "schemaUpdateMode": "Synchronize",
+        }
     ]
 }

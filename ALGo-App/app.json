@@ -1,8 +1,8 @@
 {
-  "id": "c79e64d6-f3c5-4c7c-abe9-4be9ceba45a8",
-  "name": "ALGo-App",
-  "publisher": "haih",
-  "version": "1.0.0.0",
+  "id": "e1e6fe49-c7bc-4d95-b54e-2c7dfbd78179",
+  "name": "PhilippeMarechalELCA",
+  "publisher": "Elca",
+  "version": "4.0.0.0",
   "brief": "",
   "description": "",
   "privacyStatement": "",
@@ -26,19 +26,21 @@
   ],
   "screenshots": [],
   "platform": "1.0.0.0",
-  "application": "26.0.0.0",
+  "application": "27.0.0.0",
   "idRanges": [
     {
       "from": 50100,
-      "to": 51000
+      "to": 50549
     }
   ],
   "features": [
-    "NoImplicitWith"
+    "NoImplicitWith",
+    "TranslationFile"
   ],
   "resourceExposurePolicy": {
     "allowDebugging": true,
-    "allowDownloadingSource": false,
-    "includeSourceInSymbolFile": false
-  }
+    "allowDownloadingSource": true,
+    "includeSourceInSymbolFile": true
+  },
+  "runtime": "16.0"
 }

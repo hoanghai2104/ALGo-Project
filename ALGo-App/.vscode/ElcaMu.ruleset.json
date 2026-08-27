@@ -1,0 +1,41 @@
+{
+    "name": "ElcaMu ruleset",
+    "description": "disable",
+    "rules": [
+        {
+            "id": "AA0218",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0005",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0225",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0244",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0245",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0204",
+            "action": "None",
+            "justification": "ignored"
+        },
+        {
+            "id": "AA0247",
+            "action": "Hidden",
+            "justification": "ignored"
+        }
+    ]
+}
