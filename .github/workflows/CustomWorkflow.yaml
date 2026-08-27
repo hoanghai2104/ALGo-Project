@@ -738,6 +738,310 @@ jobs:
             }
           }
 
+      - name: Analyze changes with Copilot
+        id: analyzeChanges
+        shell: pwsh
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          copilotModel: 'claude-opus-4.8'
+          currentSymbolsFolder: ${{ steps.downloadSymbols.outputs.currentSymbolsFolder }}
+          latestSymbolsFolder: ${{ steps.downloadSymbols.outputs.latestSymbolsFolder }}
+          environmentName: ${{ steps.showEnvironment.outputs.environmentName }}
+          currentVersion: ${{ steps.showEnvironment.outputs.applicationVersion }}
+          latestVersion: ${{ steps.getLatestVersion.outputs.latestVersion }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # A symbols .app is a binary package, so Copilot cannot diff the two sets of files
+          # directly. This step first turns every .app into an object/member inventory, diffs
+          # the "current" set (what the environment runs) against the "latest" set, and then
+          # hands that delta to Copilot together with the AL source in this repository so it
+          # can report the impact on our own app.
+          $rootFolder = Join-Path $env:GITHUB_WORKSPACE 'custom-output/customArtifacts'
+          $analysisFolder = Join-Path $rootFolder 'analysis'
+          New-Item -Path $analysisFolder -ItemType Directory -Force | Out-Null
+          $deltaMarkdownFile = Join-Path $analysisFolder 'symbol-changes.md'
+          $deltaJsonFile = Join-Path $analysisFolder 'symbol-changes.json'
+          $reportFile = Join-Path $analysisFolder 'copilot-analysis.md'
+
+          $currentFolder = $env:currentSymbolsFolder
+          $latestFolder = $env:latestSymbolsFolder
+          if (!$currentFolder -or !$latestFolder -or !(Test-Path $currentFolder) -or !(Test-Path $latestFolder)) {
+            Write-Host "::warning::No symbol folders available - the 'Download Symbols' step must run first. Skipping the analysis."
+            return
+          }
+
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          # --- Read SymbolReference.json out of a symbols .app ---
+          # An .app file is a small NAVX header followed by a plain zip archive, so the
+          # archive can be opened in memory once the header has been skipped.
+          function Read-AppSymbols {
+            param([string] $appFile)
+
+            $bytes = [System.IO.File]::ReadAllBytes($appFile)
+            $offset = -1
+            $limit = [Math]::Min($bytes.Length - 4, 4096)
+            for($i = 0; $i -lt $limit; $i++) {
+              if ($bytes[$i] -eq 0x50 -and $bytes[$i+1] -eq 0x4B -and $bytes[$i+2] -eq 0x03 -and $bytes[$i+3] -eq 0x04) {
+                $offset = $i
+                break
+              }
+            }
+            if ($offset -lt 0) { throw "no zip archive found in the package" }
+
+            $stream = [System.IO.MemoryStream]::new($bytes, $offset, $bytes.Length - $offset)
+            try {
+              $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read)
+              try {
+                $entry = $zip.Entries | Where-Object { $_.Name -eq 'SymbolReference.json' } | Select-Object -First 1
+                if (!$entry) { throw "SymbolReference.json not found in the package" }
+                $reader = [System.IO.StreamReader]::new($entry.Open())
+                try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+              }
+              finally { $zip.Dispose() }
+            }
+            finally { $stream.Dispose() }
+
+            return ($json | ConvertFrom-Json -AsHashtable -Depth 100)
+          }
+
+          # Object collections in SymbolReference.json, mapped onto the member list that a
+          # consumer of the symbols actually compiles against.
+          $objectKinds = [ordered]@{
+            'Tables'          = 'Fields'
+            'TableExtensions' = 'Fields'
+            'Codeunits'       = 'Methods'
+            'Interfaces'      = 'Methods'
+            'Enums'           = 'Values'
+            'EnumExtensions'  = 'Values'
+            'Pages'           = 'Methods'
+            'PageExtensions'  = 'Methods'
+            'Reports'         = 'Methods'
+            'Queries'         = $null
+            'XmlPorts'        = $null
+            'ControlAddIns'   = $null
+            'PermissionSets'  = $null
+            'Profiles'        = $null
+          }
+
+          function Get-Inventory {
+            param($symbols)
+            $inventory = @{}
+            foreach($kind in $objectKinds.Keys) {
+              $objects = $symbols[$kind]
+              if (!$objects) { continue }
+              $memberKey = $objectKinds[$kind]
+              foreach($object in @($objects)) {
+                $name = $object['Name']
+                if (!$name) { continue }
+                $members = @()
+                if ($memberKey -and $object[$memberKey]) {
+                  foreach($member in @($object[$memberKey])) {
+                    $memberName = $member['Name']
+                    if ($memberName) { $members += $memberName }
+                  }
+                }
+                $inventory["$kind/$name"] = @($members | Select-Object -Unique)
+              }
+            }
+            return $inventory
+          }
+
+          function Get-AppMap {
+            param([string] $folder, [string] $label)
+            $map = @{}
+            foreach($file in @(Get-ChildItem -Path $folder -Filter '*.app' -File -ErrorAction SilentlyContinue)) {
+              try {
+                $symbols = Read-AppSymbols -appFile $file.FullName
+                $key = "$($symbols['Publisher'])/$($symbols['Name'])"
+                $inventory = Get-Inventory -symbols $symbols
+                $map[$key] = [PSCustomObject]@{
+                  name      = $symbols['Name']
+                  publisher = $symbols['Publisher']
+                  version   = $symbols['Version']
+                  file      = $file.Name
+                  inventory = $inventory
+                }
+                Write-Host "  [$label] $($symbols['Name']) $($symbols['Version']) - $($inventory.Count) objects ($($file.Name))"
+              }
+              catch {
+                Write-Host "::warning::[$label] could not read $($file.Name) - $(($_.Exception.Message -replace '\s+', ' ').Trim())"
+              }
+              # Parsed Base Application symbols are hundreds of MB - release them again
+              $symbols = $null
+              [System.GC]::Collect()
+            }
+            return $map
+          }
+
+          Write-Host "Reading symbols on $($env:environmentName) ($($env:currentVersion))"
+          $currentApps = Get-AppMap -folder $currentFolder -label 'current'
+          Write-Host "Reading symbols at the latest version ($($env:latestVersion))"
+          $latestApps = Get-AppMap -folder $latestFolder -label 'latest'
+
+          if ($currentApps.Count -eq 0 -or $latestApps.Count -eq 0) {
+            Write-Host "::warning::Could not read symbols for both versions - skipping the analysis."
+            return
+          }
+
+          # --- Diff the two inventories ---
+          $maxItems = 60
+          function Format-Items {
+            param([string[]] $items)
+            if ($items.Count -eq 0) { return '' }
+            $text = (@($items | Select-Object -First $maxItems) -join ', ')
+            if ($items.Count -gt $maxItems) { $text += " ... and $($items.Count - $maxItems) more" }
+            return $text
+          }
+
+          $deltas = @()
+          $lines = @()
+          $lines += "# Business Central symbol changes"
+          $lines += ""
+          $lines += "Environment      : $($env:environmentName)"
+          $lines += "Version on env   : $($env:currentVersion) (the old version)"
+          $lines += "Latest available : $($env:latestVersion) (the new version)"
+          $lines += ""
+
+          foreach($key in @($currentApps.Keys | Sort-Object)) {
+            if (!$latestApps.ContainsKey($key)) {
+              $lines += "## $key - no symbols for the latest version, not compared"
+              $lines += ""
+              continue
+            }
+            $oldApp = $currentApps[$key]
+            $newApp = $latestApps[$key]
+            $oldInventory = $oldApp.inventory
+            $newInventory = $newApp.inventory
+
+            $addedObjects = @($newInventory.Keys | Where-Object { !$oldInventory.ContainsKey($_) } | Sort-Object)
+            $removedObjects = @($oldInventory.Keys | Where-Object { !$newInventory.ContainsKey($_) } | Sort-Object)
+            $changedObjects = @()
+            foreach($objectKey in @($oldInventory.Keys | Where-Object { $newInventory.ContainsKey($_) } | Sort-Object)) {
+              $oldMembers = @($oldInventory[$objectKey])
+              $newMembers = @($newInventory[$objectKey])
+              $addedMembers = @($newMembers | Where-Object { $oldMembers -notcontains $_ } | Sort-Object)
+              $removedMembers = @($oldMembers | Where-Object { $newMembers -notcontains $_ } | Sort-Object)
+              if ($addedMembers.Count -eq 0 -and $removedMembers.Count -eq 0) { continue }
+              $changedObjects += [PSCustomObject]@{
+                object         = $objectKey
+                addedMembers   = $addedMembers
+                removedMembers = $removedMembers
+              }
+            }
+
+            $deltas += [PSCustomObject]@{
+              app            = $key
+              oldVersion     = $oldApp.version
+              newVersion     = $newApp.version
+              addedObjects   = $addedObjects
+              removedObjects = $removedObjects
+              changedObjects = $changedObjects
+            }
+
+            Write-Host "$key : $($oldApp.version) -> $($newApp.version) | +$($addedObjects.Count) objects, -$($removedObjects.Count) objects, ~$($changedObjects.Count) changed"
+
+            $lines += "## $key"
+            $lines += ""
+            $lines += "$($oldApp.version) -> $($newApp.version) - $($addedObjects.Count) object(s) added, $($removedObjects.Count) removed, $($changedObjects.Count) changed"
+            $lines += ""
+            if ($removedObjects.Count -gt 0) {
+              $lines += "### Removed objects (breaking)"
+              $lines += (Format-Items -items $removedObjects)
+              $lines += ""
+            }
+            if ($addedObjects.Count -gt 0) {
+              $lines += "### Added objects"
+              $lines += (Format-Items -items $addedObjects)
+              $lines += ""
+            }
+            if ($changedObjects.Count -gt 0) {
+              $lines += "### Changed objects"
+              $lines += ""
+              $lines += "| Object | Removed members (breaking) | Added members |"
+              $lines += "| --- | --- | --- |"
+              $ordered = @($changedObjects | Sort-Object -Property @{ Expression = { $_.removedMembers.Count } } -Descending)
+              foreach($changed in @($ordered | Select-Object -First $maxItems)) {
+                $lines += "| $($changed.object) | $(Format-Items -items $changed.removedMembers) | $(Format-Items -items $changed.addedMembers) |"
+              }
+              if ($changedObjects.Count -gt $maxItems) {
+                $lines += ""
+                $lines += "$($changedObjects.Count - $maxItems) more changed object(s) - see symbol-changes.json for the complete list."
+              }
+              $lines += ""
+            }
+          }
+
+          Set-Content -Encoding UTF8 -Path $deltaMarkdownFile -Value ($lines -join "`n")
+          Set-Content -Encoding UTF8 -Path $deltaJsonFile -Value (ConvertTo-Json -InputObject @($deltas) -Depth 6)
+          Write-Host "Wrote $deltaMarkdownFile"
+          Write-Host "Wrote $deltaJsonFile"
+
+          # --- Hand the delta to Copilot ---
+          if (!$env:COPILOT_GITHUB_TOKEN) {
+            Write-Host "::warning::Secret COPILOT_GITHUB_TOKEN is not set - the raw delta was written to the artifact, but no Copilot analysis was produced."
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis`n`nSkipped - secret COPILOT_GITHUB_TOKEN is not available to this job."
+            return
+          }
+
+          Write-Host "Installing Copilot CLI"
+          npm install -g @github/copilot --no-fund --no-audit
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Could not install @github/copilot (npm exit code $LASTEXITCODE) - skipping the Copilot analysis."
+            return
+          }
+
+          $prompt = @"
+          You are reviewing a Microsoft Dynamics 365 Business Central AL project before its
+          environment is upgraded. Base your answer only on the files in this repository - do
+          not guess at Business Central internals you cannot see.
+
+          Input files:
+          - $deltaMarkdownFile : readable diff of the Microsoft symbols between the version
+            running on the environment ($($env:currentVersion), the old version) and the latest
+            available version ($($env:latestVersion), the new version).
+          - $deltaJsonFile : the same diff, complete and unabridged. Read or grep this one
+            whenever the markdown summary truncated the detail you need.
+          - ALGo-App/ : the AL source of our own app, including app.json and its dependencies.
+
+          Produce a markdown report with these sections, and nothing else:
+          1. Summary - one paragraph: how risky is this upgrade for our app?
+          2. Breaking changes that affect us - only objects and members that our AL code in
+             ALGo-App/ actually references. Give the AL file and line for each and say what
+             breaks. If there are none, say so explicitly.
+          3. Breaking changes elsewhere - removed objects and members we do not use today,
+             kept short, so we know what moved.
+          4. New capabilities worth adopting - additions in the new version that would let us
+             simplify or replace code we currently maintain in ALGo-App/.
+          5. Required action - concrete changes, including any app.json platform, application
+             or dependency version bumps.
+
+          Be concise and specific. Quote object and member names exactly as they appear in the
+          diff, and never invent a change that is not in these files.
+          "@
+
+          Write-Host "Running Copilot ($($env:copilotModel))"
+          $previousPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          $output = @(copilot -p $prompt --allow-all-tools --model $env:copilotModel 2>&1 | ForEach-Object { "$_" })
+          $exitCode = $LASTEXITCODE
+          $ErrorActionPreference = $previousPreference
+
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0 -or $output.Count -eq 0) {
+            Write-Host "::warning::Copilot exited with code $exitCode - see the log above. The raw delta is still in the artifact."
+            return
+          }
+
+          Set-Content -Encoding UTF8 -Path $reportFile -Value ($output -join "`n")
+          Write-Host "Wrote $reportFile"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis: $($env:currentVersion) -> $($env:latestVersion)`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($output -join "`n")
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
