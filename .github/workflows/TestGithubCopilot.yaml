@@ -23,4 +23,6 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
         run: |
-          copilot -p "Analyze this repository and give me a short summary of the project"
+            copilot \
+            --model claude-opus-4.8 \
+            -p "Analyze the BC symbol changes"
