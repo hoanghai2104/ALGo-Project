@@ -994,7 +994,70 @@ jobs:
             return
           }
 
-          $prompt = @"
+          # The report layout is not hard-coded here: ALGo-App/Instructions/Compare-instruction.md
+          # is the format contract for a symbol comparison report, so Copilot is pointed at it
+          # instead. Only the deviations that are specific to this workflow are spelled out below.
+          $instructionFile = Join-Path $env:GITHUB_WORKSPACE 'ALGo-App/Instructions/Compare-instruction.md'
+          if (!(Test-Path $instructionFile)) {
+            Write-Host "::warning::$instructionFile not found - falling back to the built-in report layout."
+            $instructionFile = ''
+          }
+
+          if ($instructionFile) {
+            $prompt = @"
+          You are reviewing a Microsoft Dynamics 365 Business Central AL project before its
+          environment is upgraded. Base your answer only on the files in this repository - do
+          not guess at Business Central internals you cannot see.
+
+          Input files:
+          - $deltaMarkdownFile : readable diff of the Microsoft symbols between the version
+            running on the environment ($($env:currentVersion), the old version) and the latest
+            available version ($($env:latestVersion), the new version).
+          - $deltaJsonFile : the same diff, complete and unabridged. Read or grep this one
+            whenever the markdown summary truncated the detail you need.
+          - ALGo-App/ : the AL source of our own app, including app.json and its dependencies.
+
+          OUTPUT FORMAT - MANDATORY. Read $instructionFile first; it is the format
+          contract for this report.
+          - PHASE 1 (extraction) and PHASE 2 (structured diff) have ALREADY been carried out by
+            this workflow. The two symbol packages were unpacked and diffed for you, and the
+            result is the two input files above. Do not unpack any .app file and do not look for
+            SymbolReference.json - symbol-changes.json is the authoritative diff data for this run.
+          - Apply PHASE 3 (breaking-change classification) to that diff, using its rules as written.
+          - Emit the report in the PHASE 4 skeleton (sections 1-7 plus "Conclusion & action items"),
+            omitting any section that has no data rather than writing "nothing here".
+          - Obey the section 5 WRITING RULES and run the section 6 SELF-CHECK before answering.
+
+          Deviations from the instruction file that apply to this run:
+          - Section 1 "Metadata": report the environment name, the version on the environment
+            ($($env:currentVersion), old) and the latest available version ($($env:latestVersion),
+            new), plus the per-app old -> new versions from the diff. There is no manifest,
+            compiler or MovedObjectsManifest data in these input files - omit those rows.
+          - Sections 3 and 6 must be scoped to our own app first: for every breaking or
+            data-behavior change, state whether the AL code in ALGo-App/ actually references that
+            object or member, and give the AL file and line when it does. Say so explicitly when
+            nothing in ALGo-App/ is affected.
+          - Add a "### 8. New capabilities worth adopting" section before the conclusion:
+            additions in the new version that would let us simplify or replace code we currently
+            maintain in ALGo-App/.
+          - The closing checklist must name any required app.json platform, application or
+            dependency version bump.
+          - Coverage limits of this diff - never fill these gaps by guessing:
+            * it lists object and member NAMES only, so method signatures, parameter lists,
+              properties, CalcFormula, ObsoleteState and enum ordinals are NOT available. Report a
+              PHASE 3 classification only where the input files support it, and say plainly when
+              the data cannot settle a question.
+            * object Ids are not part of this diff. The WRITING RULE "always include the object
+              Id" is therefore relaxed: name the object without an Id unless you can read the Id
+              out of the AL source in ALGo-App/. Never recall an Id from memory.
+          - The scratchpad-paths line in the PHASE 4 conclusion refers to $deltaMarkdownFile and
+            $deltaJsonFile.
+
+          Output the markdown report and nothing else.
+          "@
+          }
+          else {
+            $prompt = @"
           You are reviewing a Microsoft Dynamics 365 Business Central AL project before its
           environment is upgraded. Base your answer only on the files in this repository - do
           not guess at Business Central internals you cannot see.
@@ -1022,6 +1085,7 @@ jobs:
           Be concise and specific. Quote object and member names exactly as they appear in the
           diff, and never invent a change that is not in these files.
           "@
+          }
 
           Write-Host "Running Copilot ($($env:copilotModel))"
           $previousPreference = $ErrorActionPreference
