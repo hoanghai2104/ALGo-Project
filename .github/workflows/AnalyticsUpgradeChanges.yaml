@@ -822,11 +822,15 @@ jobs:
             --al-source 'ALGo-App' `
             --business-areas "$businessAreas" `
             --resolution (Join-Path $reportFolder 'resolution.json') `
+            --object-index (Join-Path $reportFolder 'object-index.json') `
             --out-dir "$reportFolder"
           if ($LASTEXITCODE -ne 0) { throw "The business rollup failed (exit code $LASTEXITCODE)." }
 
           $rollup = Get-Content -Path (Join-Path $reportFolder 'business-impact.json') -Raw -Encoding UTF8 | ConvertFrom-Json
           $counts = $rollup.counts
+          $own = $rollup.customization
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Our customization`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| | Total | Changed | Removed | Incompatible | Not analysed |`n| --- | --- | --- | --- | --- | --- |`n| Extension points | $($own.extensionPoints) | $($own.extensionsChanged) | $($own.extensionsRemoved) | - | $($own.extensionsNotAnalysed) |`n| Event subscriptions | $($own.subscriptions) | - | $($own.subscriptionsRemoved) | $($own.subscriptionsIncompatible) | $($own.subscriptionsNotAnalysed) |"
           # Measure-Object over no properties returns $null, which would render
           # as an empty cell rather than a zero.
           $outOfScope = ($rollup.outOfScopeByArea.PSObject.Properties | Measure-Object -Property Value -Sum).Sum
@@ -894,6 +898,7 @@ jobs:
           $summaryFile = Join-Path $reportFolder 'summary.json'
           $resolutionFile = Join-Path $reportFolder 'resolution.json'
           $businessJsonFile = Join-Path $reportFolder 'business-impact.json'
+          $footprintFile = Join-Path $reportFolder 'customization-footprint.json'
           $technicalReportFile = Join-Path $reportFolder 'technical-analysis.md'
           $functionalReportFile = Join-Path $reportFolder 'functional-impact.md'
           $stdoutFile = Join-Path $reportFolder 'copilot-stdout.txt'
@@ -943,8 +948,15 @@ jobs:
           - $businessJsonFile : the functional rollup, produced from the diff by
             .github/scripts/diff_symbols.py rollup. Already filtered to consequences a user or
             the data can notice, already tiered by whether our code or our business areas are
-            involved, and already carrying the on-screen Caption of every object.
-            THIS IS THE INPUT FOR THE FUNCTIONAL REPORT.
+            involved, and already carrying the on-screen Caption of every object. Its
+            'affectedCustomization' holds only the extension points and event subscriptions
+            that this upgrade actually touches. THIS IS THE INPUT FOR THE FUNCTIONAL REPORT.
+          - $footprintFile : the full inventory of OUR OWN app cross-referenced against the
+            diff - every one of our extension points and event subscriptions with a state of
+            unchanged / changed / removed / incompatible / obsoleted / not-analysed, each with
+            our AL file and line, plus 'byFile' totals. 'not-analysed' means the base object
+            belongs to a package that could not be compared: it is a blind spot, never an
+            all-clear. THIS IS AN INPUT FOR THE TECHNICAL REPORT.
           - $summaryFile : headline counts for the whole run.
           - $resolutionFile : which feed build was used for each package, and which packages
             could not be compared.
@@ -984,6 +996,21 @@ jobs:
             removals. Do not report them as breaking unless our code qualifies them by
             namespace.
           - Add a "### 8. New capabilities worth adopting" section before the conclusion.
+          - Add these three sections from $footprintFile, before the conclusion. They answer
+            "what of OURS sits on top of what Microsoft changed", which the diff alone cannot:
+            * "### 9. Our extension surface" - EVERY row of extensionSurface, not just the
+              affected ones, as: our object and Id, our AL file, the base object it extends
+              (by targetLabel), the owning package, and the state. Sort removed and
+              not-analysed first, then changed, then unchanged. A reader must be able to use
+              this as a pre-upgrade checklist, so an unchanged row is a result, not filler.
+            * "### 10. Our event subscriptions" - EVERY row of eventSubscriptions, as: our AL
+              file and line, the publishing object, the event, the hooked field where
+              'element' is set, and the state. For a table trigger, say plainly that what
+              matters is the field, not the event name.
+            * "### 11. Work by file" - the byFile totals, sorted by needsAction descending, so
+              the work can be assigned.
+          - Any 'not-analysed' row must also appear in the conclusion's blind-spot list. Never
+            describe a not-analysed extension point as unaffected.
           - The closing checklist must name any required app.json platform, application or
             dependency version bump.
           - Packages listed as not compared in $resolutionFile are blind spots; list them in

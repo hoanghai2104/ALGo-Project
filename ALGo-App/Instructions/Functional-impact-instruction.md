@@ -44,6 +44,21 @@ Each finding carries:
 Also present: `areas` (scope), `customizationFootprint`, `outOfScopeByArea` (counts only),
 `suppressedAsTechnical`, `coverageGaps`, `counts`.
 
+`customization` holds the totals for our own app, and `affectedCustomization` holds only
+the parts this upgrade actually touches — use these for section 4 of the report:
+
+| Field | Meaning |
+|---|---|
+| `customization.extensionPoints` | how many places our app extends a standard object |
+| `customization.subscriptions` | how many standard events our app hooks |
+| `customization.*NotAnalysed` | places we could not check — a blind spot, never an all-clear |
+| `affectedCustomization.extensionSurface[]` | `ourName`, `targetLabel` (the standard screen or table, as the user sees it), `area`, `status`, `file` |
+| `affectedCustomization.eventSubscriptions[]` | `hostLabel`, `event`, `element` (the field a trigger hooks), `area`, `status`, `file` |
+
+`status` values: `changed` (the standard object our customization sits on has changed),
+`removed` (it is gone), `incompatible` (a developer must fix it), `obsoleted` (it is being
+retired), `not-analysed` (we could not check it).
+
 The rollup already dropped renames, namespace moves, internal visibility changes and
 attribute churn. Do not reintroduce them.
 
@@ -82,6 +97,7 @@ breaking change
 Conclusion
 Must be handled before the upgrade
 Needs re-testing
+Our customizations affected
 Scope considered
 ```
 
@@ -148,6 +164,20 @@ row.
 Priority: High where the customization is involved or where a calculation changed,
 Medium otherwise.
 
+## 🧩 Our customizations affected  (n)
+| # | Our customization | Where the user sees it | Area | What it means |
+One row per entry in affectedCustomization (both lists). "Our customization" is our own
+object name from `ourName` — say what it does in plain words where the name makes that
+obvious ("our extension on the Service Order screen"), otherwise keep the name as-is.
+"Where the user sees it" is `targetLabel` or `hostLabel`. Do not print `file` or `line`:
+those belong in the technical report.
+For a `status` of `incompatible` or `removed`, the row must say a developer has to act
+before the upgrade. For `not-analysed`, the row must say plainly that this one could not
+be checked — do not leave it looking safe.
+Close the section with one sentence giving the coverage: how many of our
+`customization.extensionPoints` extension points and `customization.subscriptions` event
+hooks were checked, and how many were not.
+
 ## 🟢 Opportunities to retire customization  (n)
 | New standard capability | Could replace | Notes |
 Only include a row when you can actually see the corresponding customization in
@@ -175,3 +205,5 @@ that those were not assessed.
 6. No finding appears that is not in `business-impact.json`.
 7. The conclusion gives a risk level and the reason for it, not just a restatement of the
    numbers.
+8. Every `not-analysed` entry is described as unchecked, never as unaffected.
+9. The "Our customizations affected" section ends with the coverage sentence.

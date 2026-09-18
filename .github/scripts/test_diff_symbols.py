@@ -380,14 +380,20 @@ check('an empty namespace is Unclassified', ds.area_of('') == 'Unclassified')
 
 
 def al_index(objects=None, events=None, members=None, files=1):
-    """Stand in for a scan of our AL source."""
+    """Stand in for a scan of our AL source.
+
+    Keys are lower-cased, exactly as scan_al_source produces them - AL is
+    case-insensitive about object and member names.
+    """
     return {
-        'objects': {name: [{'file': 'Src/X.al', 'line': 10, 'how': 'record'}]
+        'objects': {name.lower(): [{'file': 'Src/X.al', 'line': 10, 'how': 'record'}]
                     for name in (objects or [])},
-        'events': {key: [{'file': 'Src/X.al', 'line': 20, 'how': 'subscriber'}]
-                   for key in (events or [])},
-        'members': {name: [{'file': 'Src/X.al', 'line': 30, 'how': 'member'}]
+        'events': {(host.lower(), event.lower()):
+                   [{'file': 'Src/X.al', 'line': 20, 'how': 'subscriber'}]
+                   for host, event in (events or [])},
+        'members': {name.lower(): [{'file': 'Src/X.al', 'line': 30, 'how': 'member'}]
                     for name in (members or [])},
+        'extensions': [], 'subscriptions': [], 'ownObjects': [],
         'alFiles': files,
     }
 
@@ -571,6 +577,206 @@ check('every severity section is rendered',
 check('the fallback names things by Caption, not by object name',
       'Sales Orders' in text and 'Sales Order List' not in text)
 
+print('\nAL scanner - the four spellings real code uses')
+
+AL_SOURCE = """namespace Elca.Test;
+using Microsoft.Sales.Document;
+
+tableextension 50100 "ItemExt" extends Item
+{
+    fields { field(50100; Foo; Text[10]) { } }
+}
+pageextension 50101 Customercard extends Microsoft.Sales.Customer."Customer Card"
+{
+}
+tableextension 50125 ServiceInvoiceLine extends "Service Invoice line"
+{
+}
+reportextension 50140 Reminder extends Reminder
+{
+}
+codeunit 50110 Handler
+{
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Sales-Post", 'OnBeforePostSalesDoc', '', false, false)]
+    local procedure A(var SalesHeader: Record "Sales Header") begin end;
+
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::OrderTrackingManagement, OnBeforeTempOrderTrackingEntryInsert, '', false, false)]
+    local procedure B() begin end;
+
+    [EventSubscriber(ObjectType::Table, Database::"Service Header", OnAfterValidateEvent, "Ship-to Code", false, false)]
+    local procedure C(var Rec: Record "Service Header") begin end;
+
+    var
+        Cust: Record Customer;
+        Res: Record Resource;
+}
+"""
+
+
+def scan_fixture(source):
+    folder = tempfile.mkdtemp()
+    os.makedirs(os.path.join(folder, 'Src'), exist_ok=True)
+    with open(os.path.join(folder, 'Src', 'Fixture.al'), 'w', encoding='utf-8') as handle:
+        handle.write(source)
+    try:
+        return ds.scan_al_source(folder)
+    finally:
+        os.unlink(os.path.join(folder, 'Src', 'Fixture.al'))
+        os.rmdir(os.path.join(folder, 'Src'))
+        os.rmdir(folder)
+
+
+scan = scan_fixture(AL_SOURCE)
+targets = {x['target'] for x in scan['extensions']}
+check('a bare identifier target is captured (extends Item)', 'Item' in targets,
+      '(got %r)' % sorted(targets))
+check('a namespace-qualified target is captured', 'Customer Card' in targets,
+      '(got %r)' % sorted(targets))
+check('a target whose case differs from the symbol is captured',
+      'Service Invoice line' in targets)
+check('a target that shares its name with our object is captured (extends Reminder)',
+      'Reminder' in targets)
+check('all four extension points are found', len(scan['extensions']) == 4,
+      '(got %d)' % len(scan['extensions']))
+
+check('object names are indexed lower-case for case-insensitive lookup',
+      'service invoice line' in scan['objects'] and 'item' in scan['objects'])
+check('bare Record types are captured',
+      'customer' in scan['objects'] and 'resource' in scan['objects'])
+
+check('all three subscriptions are found', len(scan['subscriptions']) == 3,
+      '(got %d)' % len(scan['subscriptions']))
+events = {(x['host'], x['event']) for x in scan['subscriptions']}
+check('a quoted event name is captured', ('Sales-Post', 'OnBeforePostSalesDoc') in events)
+check('a bare event name is captured',
+      ('OrderTrackingManagement', 'OnBeforeTempOrderTrackingEntryInsert') in events,
+      '(got %r)' % sorted(events))
+trigger = next((x for x in scan['subscriptions'] if x['objectType'].lower() == 'table'), None)
+check('a table trigger records the field it hooks',
+      trigger and trigger['element'] == 'Ship-to Code',
+      '(got %r)' % (trigger or {}).get('element'))
+check('the hooked field lands in the member index',
+      'ship-to code' in scan['members'])
+check('our own declarations are inventoried', len(scan['ownObjects']) == 5,
+      '(got %d)' % len(scan['ownObjects']))
+
+print('\nCross-reference - our customization against the diff')
+
+
+def index_of(*objects):
+    return {'apps': ['Microsoft/Base Application'],
+            'objects': {o['name'].lower(): dict(o, app='Microsoft/Base Application')
+                        for o in objects}}
+
+
+SALES_HEADER = {'name': 'Sales Header', 'kind': 'Tables', 'id': 36,
+                'namespace': 'Microsoft.Sales.Document', 'caption': 'Sales Header'}
+SERVICE_HEADER = {'name': 'Service Header', 'kind': 'Tables', 'id': 5900,
+                  'namespace': 'Microsoft.Service.Document', 'caption': 'Service Order'}
+SALES_POST = {'name': 'Sales-Post', 'kind': 'Codeunits', 'id': 80,
+              'namespace': 'Microsoft.Sales.Document', 'caption': None}
+
+EXT_ONE = {'kind': 'tableextension', 'id': '50105', 'name': 'SalesHeaderExt',
+           'file': 'Src/TableExt/SalesHeaderExt.TableExt.al', 'line': 1, 'target': 'Sales Header'}
+SUB_ONE = {'file': 'Src/Codeunit/X.al', 'line': 8, 'objectType': 'Codeunit',
+           'host': 'Sales-Post', 'event': 'OnBeforePostSalesDoc', 'element': ''}
+
+
+def crossref(extensions, subscriptions, report, index):
+    al = {'extensions': extensions, 'subscriptions': subscriptions, 'ownObjects': [],
+          'objects': {}, 'events': {}, 'members': {}, 'alFiles': 1}
+    return ds.cross_reference(al, report, index)
+
+
+result = crossref([EXT_ONE], [], wrap(), index_of(SALES_HEADER))
+check('an untouched base object is reported as unchanged, not as a risk',
+      result['extensionSurface'][0]['status'] == 'unchanged')
+check('the base object is named by its Caption',
+      result['extensionSurface'][0]['targetLabel'] == 'Sales Header')
+
+result = crossref([EXT_ONE], [], wrap(), index_of(SERVICE_HEADER))
+check('a base object no compared package defines is NOT reported as unchanged',
+      result['extensionSurface'][0]['status'] == 'not-analysed',
+      '(got %r)' % result['extensionSurface'][0]['status'])
+check('and it says why', 'could not be compared'
+      in result['extensionSurface'][0].get('reason', ''))
+
+result = crossref([EXT_ONE], [],
+                  wrap(removedObjects=[obj(name='Sales Header', caption='Sales Header')]),
+                  index_of(SALES_HEADER))
+check('a removed base object is reported as removed',
+      result['extensionSurface'][0]['status'] == 'removed')
+
+result = crossref([EXT_ONE], [],
+                  wrap(changedObjects=[changed(caption='Sales Header', changed_members=[
+                      {'name': 'Amount', 'caption': 'Amount', 'old': 'a', 'new': 'b',
+                       'category': 'data', 'reasons': ['CalcFormula x -> y']}])]),
+                  index_of(SALES_HEADER))
+entry = result['extensionSurface'][0]
+check('a changed base object is reported as changed', entry['status'] == 'changed')
+check('and carries a summary of what changed',
+      entry['summary']['changedMembers'] == 1 and entry['summary']['data'] == 1,
+      '(got %r)' % entry.get('summary'))
+
+# Case-insensitivity end to end: our code says "sales header", symbols say "Sales Header".
+result = crossref([dict(EXT_ONE, target='sales header')], [],
+                  wrap(removedObjects=[obj(name='Sales Header')]), index_of(SALES_HEADER))
+check('matching ignores case, as AL does',
+      result['extensionSurface'][0]['status'] == 'removed')
+
+result = crossref([], [SUB_ONE],
+                  wrap(changedObjects=[changed(kind='Codeunits', name='Sales-Post', oid=80,
+                                               changed_members=[{
+                                                   'name': 'OnBeforePostSalesDoc',
+                                                   'caption': None, 'old': 'a(x)',
+                                                   'new': 'a(x; y)', 'category': 'breaking',
+                                                   'reasons': ['parameter list changed in place']}])]),
+                  index_of(SALES_POST))
+entry = result['eventSubscriptions'][0]
+check('a subscription whose event changed incompatibly is flagged',
+      entry['status'] == 'incompatible', '(got %r)' % entry['status'])
+check('it points at our file and line',
+      entry['file'] == 'Src/Codeunit/X.al' and entry['line'] == 8)
+
+result = crossref([], [SUB_ONE],
+                  wrap(changedObjects=[changed(kind='Codeunits', name='Sales-Post', oid=80,
+                                               changed_members=[{
+                                                   'name': 'SomethingElse', 'caption': None,
+                                                   'old': 'a', 'new': 'b',
+                                                   'category': 'breaking', 'reasons': []}])]),
+                  index_of(SALES_POST))
+entry = result['eventSubscriptions'][0]
+check('a change elsewhere in the same object does not flag our subscription',
+      entry['status'] == 'unchanged', '(got %r)' % entry['status'])
+check('but it says the object did change', 'changed elsewhere' in entry.get('note', ''))
+
+# The failure mode a name-only diff cannot see: the event is untouched, but the
+# FIELD the trigger hangs off is gone.
+TRIGGER_SUB = {'file': 'Src/Codeunit/BusinessEventHandler.codeunit.al', 'line': 20,
+               'objectType': 'Table', 'host': 'Service Header',
+               'event': 'OnAfterValidateEvent', 'element': 'Ship-to Code'}
+result = crossref([], [TRIGGER_SUB],
+                  wrap(changedObjects=[changed(name='Service Header', oid=5900,
+                                               ns='Microsoft.Service.Document',
+                                               caption='Service Order',
+                                               removed_members=[{
+                                                   'name': 'Ship-to Code',
+                                                   'signature': 'Ship-to Code: Code[10]',
+                                                   'caption': 'Ship-to Code'}])]),
+                  index_of(SERVICE_HEADER))
+entry = result['eventSubscriptions'][0]
+check('a table trigger breaks when the field it hooks is removed',
+      entry['status'] == 'removed', '(got %r)' % entry['status'])
+check('and it names the field, not the event', 'Ship-to Code' in entry.get('reason', ''))
+
+result = crossref([EXT_ONE], [SUB_ONE],
+                  wrap(removedObjects=[obj(name='Sales Header')]),
+                  index_of(SALES_HEADER, SALES_POST))
+check('work is aggregated per our own file',
+      result['byFile']['Src/TableExt/SalesHeaderExt.TableExt.al']['needsAction'] == 1
+      and result['byFile']['Src/Codeunit/X.al']['needsAction'] == 0,
+      '(got %r)' % result['byFile'])
+
 print('\nReport check - the contract a consultant edits is the one enforced')
 
 INSTRUCTION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -641,6 +847,12 @@ Two items must be handled before the upgrade. Risk level: MEDIUM.
 ## Needs re-testing (1)
 | # | Process to test | Why | Area | Priority |
 | 1 | Create and post a sales order | A calculation changed | Sales | High |
+
+## Our customizations affected (1)
+| # | Our customization | Where the user sees it | Area | What it means |
+| 1 | SalesHeaderExt | Sales Header | Sales | The standard table changed; re-test order entry |
+
+Checked 95 of 95 extension points and 55 of 55 event hooks.
 
 ## Scope considered
 Sales, Service and Finance were examined.

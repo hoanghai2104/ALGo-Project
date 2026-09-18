@@ -769,29 +769,81 @@ def area_of(namespace):
     return segments[0]
 
 
-# How our AL source can name a Microsoft object.
+# How our AL source can name a Microsoft object. All four spellings below occur
+# in real code and the earlier version of this scanner only matched the first:
+#
+#   extends "Sales Header"                        quoted
+#   extends Item                                  bare identifier - legal when
+#                                                 the name needs no quoting
+#   extends Microsoft.Sales.Customer."Customer Card"   namespace-qualified
+#   extends "Service Invoice line"                a different case to the real
+#                                                 object name - AL does not care
+#
+# Object names are therefore matched case-insensitively throughout, and every
+# pattern tolerates an optional namespace prefix.
+_NAME = r'(?:[\w]+(?:\.[\w]+)*\.)?(?:"([^"]+)"|([A-Za-z]\w*))'
+
 AL_REFERENCE_PATTERNS = [
     (re.compile(r'\b(?:table|page|report|enum|permissionset|profile)extension\s+\d+\s+'
-                r'(?:"[^"]+"|\w+)\s+extends\s+"([^"]+)"', re.IGNORECASE), 'extends'),
-    (re.compile(r'\bRecord\s+"([^"]+)"', re.IGNORECASE), 'record'),
-    (re.compile(r'\b(?:Codeunit|Page|Report|Table|Enum|Query|XmlPort|Interface)::"([^"]+)"',
+                r'(?:"[^"]+"|\w+)\s+extends\s+' + _NAME, re.IGNORECASE), 'extends'),
+    (re.compile(r'\bRecord\s+' + _NAME, re.IGNORECASE), 'record'),
+    (re.compile(r'\b(?:Codeunit|Page|Report|Table|Enum|Query|XmlPort|Interface)::' + _NAME,
                 re.IGNORECASE), 'reference'),
-    (re.compile(r'SourceTable\s*=\s*"([^"]+)"', re.IGNORECASE), 'sourcetable'),
+    (re.compile(r'SourceTable\s*=\s*' + _NAME, re.IGNORECASE), 'sourcetable'),
 ]
+
+# The event name is the third argument and may be a quoted string or a bare
+# identifier; 44 of the 55 subscriptions in this repository use the bare form,
+# which the earlier pattern could not see at all.
+#
+# The fourth argument matters for table triggers: with ObjectType::Table it is
+# the field the subscriber hooks, as in
+#   (ObjectType::Table, Database::"Service Header", OnAfterValidateEvent, "Ship-to Code", ...)
+# so that subscriber is at risk when the FIELD changes, not when a method does.
+# For a codeunit event the argument is an unused '' and there is nothing to read.
 AL_EVENT_PATTERN = re.compile(
-    r'EventSubscriber\s*\(\s*ObjectType::\w+\s*,\s*\w+::"([^"]+)"\s*,\s*\'([^\']*)\'',
+    r'EventSubscriber\s*\(\s*ObjectType::(\w+)\s*,\s*\w+::' + _NAME +
+    r'\s*,\s*(?:\'([^\']*)\'|([A-Za-z]\w*))'
+    r'(?:\s*,\s*(?:"([^"]+)"|\'([^\']*)\'))?',
     re.IGNORECASE)
+
+# Our own object declarations, and what they extend.
+AL_DECLARATION_PATTERN = re.compile(
+    r'^\s*(tableextension|pageextension|reportextension|enumextension|permissionsetextension'
+    r'|profileextension|table|page|report|codeunit|enum|query|interface|permissionset|profile)'
+    r'\s+(\d+)\s+("(?:[^"]+)"|\w+)(?:\s+extends\s+' + _NAME + r')?',
+    re.IGNORECASE)
+
 # A quoted identifier after a dot - field access such as SalesHeader."No.".
 # Deliberately loose: it is used only to decide whether a member finding is
 # worth showing, never to claim a definite reference.
 AL_MEMBER_PATTERN = re.compile(r'\w\s*\.\s*"([^"]+)"')
 
+EXTENSION_KINDS = {'tableextension', 'pageextension', 'reportextension', 'enumextension',
+                   'permissionsetextension', 'profileextension'}
+
+
+def _pick(groups):
+    """The first non-empty group of a quoted-or-bare name alternation."""
+    for value in groups:
+        if value:
+            return value
+    return ''
+
 
 def scan_al_source(folder):
-    """What Microsoft objects and members does our own AL code name?"""
+    """Inventory our own AL code: what it declares, extends and subscribes to.
+
+    Object names are keyed lower-case because AL is case-insensitive about them,
+    and real code does not match the symbol casing - this repository extends
+    "Service Invoice line" where Microsoft spells it "Service Invoice Line".
+    """
     objects = {}
     events = {}
     members = {}
+    extensions = []
+    subscriptions = []
+    own_objects = []
     files = 0
 
     for root, _dirs, names in os.walk(folder):
@@ -811,20 +863,51 @@ def scan_al_source(folder):
 
             relative = os.path.relpath(path, folder).replace(os.sep, '/')
             for number, line in enumerate(lines, 1):
+                reference = {'file': relative, 'line': number}
+
                 for pattern, how in AL_REFERENCE_PATTERNS:
                     for match in pattern.findall(line):
-                        objects.setdefault(match, []).append(
-                            {'file': relative, 'line': number, 'how': how})
-                for object_name, event_name in AL_EVENT_PATTERN.findall(line):
-                    events.setdefault((object_name, event_name), []).append(
-                        {'file': relative, 'line': number, 'how': 'subscriber'})
-                    objects.setdefault(object_name, []).append(
-                        {'file': relative, 'line': number, 'how': 'subscriber'})
-                for member_name in AL_MEMBER_PATTERN.findall(line):
-                    members.setdefault(member_name, []).append(
-                        {'file': relative, 'line': number, 'how': 'member'})
+                        target = _pick(match if isinstance(match, tuple) else (match,))
+                        if target:
+                            objects.setdefault(target.lower(), []).append(
+                                dict(reference, how=how, name=target))
 
-    return {'objects': objects, 'events': events, 'members': members, 'alFiles': files}
+                for match in AL_EVENT_PATTERN.findall(line):
+                    object_type = match[0]
+                    host = _pick(match[1:3])
+                    event = _pick(match[3:5])
+                    element = _pick(match[5:7])
+                    if not host or not event:
+                        continue
+                    subscriptions.append(dict(reference, objectType=object_type, host=host,
+                                              event=event, element=element))
+                    events.setdefault((host.lower(), event.lower()), []).append(
+                        dict(reference, how='subscriber', name=host))
+                    objects.setdefault(host.lower(), []).append(
+                        dict(reference, how='subscriber', name=host))
+                    if element:
+                        # The hooked field is a member reference in its own right.
+                        members.setdefault(element.lower(), []).append(
+                            dict(reference, how='trigger-field', name=element))
+
+                declaration = AL_DECLARATION_PATTERN.match(line)
+                if declaration:
+                    kind = declaration.group(1).lower()
+                    own = {'kind': kind, 'id': declaration.group(2),
+                           'name': declaration.group(3).strip('"'), 'file': relative,
+                           'line': number}
+                    own_objects.append(own)
+                    target = _pick(declaration.groups()[3:5])
+                    if kind in EXTENSION_KINDS and target:
+                        extensions.append(dict(own, target=target))
+
+                for member_name in AL_MEMBER_PATTERN.findall(line):
+                    members.setdefault(member_name.lower(), []).append(
+                        dict(reference, how='member', name=member_name))
+
+    return {'objects': objects, 'events': events, 'members': members,
+            'extensions': extensions, 'subscriptions': subscriptions,
+            'ownObjects': own_objects, 'alFiles': files}
 
 
 def user_label(entry):
@@ -866,7 +949,7 @@ def build_rollup(report, al_index, declared_areas):
             # Every collection carries 'name' and 'namespace'; a rename also
             # carries the old name, and our AL source may still use either.
             names = [obj.get('name'), obj.get('oldName')]
-            if any(name and name in referenced_objects for name in names):
+            if any(name and name.lower() in referenced_objects for name in names):
                 area = area_of(obj.get('namespace'))
                 auto_areas.add(area)
                 footprint_by_area[area] += 1
@@ -879,10 +962,13 @@ def build_rollup(report, al_index, declared_areas):
     suppressed = Counter()
 
     def references_for(name, member=None):
-        found = list(referenced_objects.get(name, []))
+        # AL is case-insensitive about object and member names, and real code
+        # does not match the symbol casing, so every lookup is lower-cased.
+        key = (name or '').lower()
+        found = list(referenced_objects.get(key, []))
         if member:
-            found += referenced_events.get((name, member), [])
-            found += referenced_members.get(member, [])
+            found += referenced_events.get((key, member.lower()), [])
+            found += referenced_members.get(member.lower(), [])
         return found
 
     for app in report['apps']:
@@ -1026,6 +1112,199 @@ def reason_has_type_change(reasons):
     return any(reason.startswith('type ') for reason in reasons)
 
 
+# --------------------------------------------------------------------------
+# Cross-reference: our customization against the diff
+#
+# The diff answers "what did Microsoft change". This answers the question a
+# developer and a consultant actually ask: "what of OURS sits on top of that".
+# Every extension point and every event subscription is resolved against the
+# compared packages and given one of four states - and 'not-analysed' is a
+# first-class answer, never quietly folded into 'unchanged'.
+# --------------------------------------------------------------------------
+
+def index_delta_by_name(report):
+    """{lower object name: {'removed'|'added'|'changed'|'renamed'|'moved': entry}}"""
+    index = {}
+    for app in report['apps']:
+        delta = app['delta']
+        for group, label in (('removedObjects', 'removed'), ('addedObjects', 'added'),
+                             ('changedObjects', 'changed'), ('renamedObjects', 'renamed'),
+                             ('movedObjects', 'moved')):
+            for obj in delta[group]:
+                for name in (obj.get('name'), obj.get('oldName')):
+                    if name:
+                        index.setdefault(name.lower(), {}).setdefault(label, obj)
+    return index
+
+
+def summarise_changed_object(obj):
+    counts = Counter()
+    counts['propertyChanges'] = len(obj['propertyChanges'])
+    counts['removedMembers'] = len(obj['removedMembers'])
+    counts['addedMembers'] = len(obj['addedMembers'])
+    counts['changedMembers'] = len(obj['changedMembers'])
+    for change in obj['propertyChanges']:
+        counts[change['category']] += 1
+    for member in obj['changedMembers']:
+        counts[member.get('category', 'info')] += 1
+    counts['breaking'] += len(obj['removedMembers'])
+    return dict(counts)
+
+
+def find_member(obj, name):
+    """A member of a changed object, by name, case-insensitively."""
+    if not obj or not name:
+        return None, None
+    needle = name.lower()
+    for member in obj['removedMembers']:
+        if member['name'].lower() == needle:
+            return 'removed', member
+    for member in obj['changedMembers']:
+        if member['name'].lower() == needle:
+            return 'changed', member
+    for member in obj['addedMembers']:
+        if member['name'].lower() == needle:
+            return 'added', member
+    return None, None
+
+
+def cross_reference(al_index, report, object_index):
+    """Give every extension point and subscription a state against the diff."""
+    delta = index_delta_by_name(report)
+    known = object_index.get('objects', {})
+
+    def resolve(name):
+        return known.get((name or '').lower())
+
+    extension_surface = []
+    for extension in al_index['extensions']:
+        target = extension['target']
+        meta = resolve(target)
+        found = delta.get(target.lower(), {})
+
+        entry = {
+            'ourKind': extension['kind'],
+            'ourId': extension['id'],
+            'ourName': extension['name'],
+            'file': extension['file'],
+            'line': extension['line'],
+            'target': target,
+            'targetLabel': (meta or {}).get('caption') or (meta or {}).get('name') or target,
+            'targetKind': (meta or {}).get('kind'),
+            'targetApp': (meta or {}).get('app'),
+            'area': area_of((meta or {}).get('namespace')) if meta else None,
+        }
+
+        if meta is None:
+            entry['status'] = 'not-analysed'
+            entry['reason'] = ('no compared package defines "%s" - it belongs to a package '
+                               'that could not be compared' % target)
+        elif 'removed' in found:
+            entry['status'] = 'removed'
+            entry['reason'] = 'the object our extension rides on no longer exists'
+        elif 'changed' in found:
+            entry['status'] = 'changed'
+            entry['summary'] = summarise_changed_object(found['changed'])
+        else:
+            entry['status'] = 'unchanged'
+        extension_surface.append(entry)
+
+    subscriptions = []
+    for subscription in al_index['subscriptions']:
+        host = subscription['host']
+        meta = resolve(host)
+        found = delta.get(host.lower(), {})
+        changed_object = found.get('changed')
+
+        entry = {
+            'file': subscription['file'],
+            'line': subscription['line'],
+            'objectType': subscription['objectType'],
+            'host': host,
+            'hostLabel': (meta or {}).get('caption') or (meta or {}).get('name') or host,
+            'hostApp': (meta or {}).get('app'),
+            'event': subscription['event'],
+            'element': subscription['element'],
+            'area': area_of((meta or {}).get('namespace')) if meta else None,
+        }
+
+        if meta is None:
+            entry['status'] = 'not-analysed'
+            entry['reason'] = ('no compared package defines "%s" - this subscription could '
+                               'not be checked' % host)
+            subscriptions.append(entry)
+            continue
+        if 'removed' in found:
+            entry['status'] = 'removed'
+            entry['reason'] = 'the object publishing this event no longer exists'
+            subscriptions.append(entry)
+            continue
+
+        # A table-trigger subscription hangs off a FIELD, not a published
+        # method, so that is what has to be checked for it.
+        probe = subscription['element'] if subscription['element'] else subscription['event']
+        state, member = find_member(changed_object, probe)
+
+        if state == 'removed':
+            entry['status'] = 'removed'
+            entry['reason'] = '"%s" no longer exists on %s' % (probe, host)
+        elif state == 'changed':
+            category = member.get('category', 'info')
+            entry['reasons'] = member.get('reasons', [])
+            if category == 'breaking':
+                entry['status'] = 'incompatible'
+            elif category == 'obsolete':
+                entry['status'] = 'obsoleted'
+            else:
+                entry['status'] = 'changed'
+            entry['old'] = member.get('old')
+            entry['new'] = member.get('new')
+        elif changed_object is not None:
+            entry['status'] = 'unchanged'
+            entry['note'] = ('%s changed elsewhere, but not in what this subscription binds to'
+                             % host)
+        else:
+            entry['status'] = 'unchanged'
+        subscriptions.append(entry)
+
+    by_file = {}
+    for item in extension_surface:
+        bucket = by_file.setdefault(item['file'], {'extensions': 0, 'subscriptions': 0,
+                                                   'needsAction': 0})
+        bucket['extensions'] += 1
+        if item['status'] in ('removed', 'not-analysed'):
+            bucket['needsAction'] += 1
+    for item in subscriptions:
+        bucket = by_file.setdefault(item['file'], {'extensions': 0, 'subscriptions': 0,
+                                                   'needsAction': 0})
+        bucket['subscriptions'] += 1
+        if item['status'] in ('removed', 'incompatible', 'not-analysed'):
+            bucket['needsAction'] += 1
+
+    return {
+        'extensionSurface': extension_surface,
+        'eventSubscriptions': subscriptions,
+        'byFile': dict(sorted(by_file.items(),
+                              key=lambda kv: (-kv[1]['needsAction'], kv[0]))),
+        'counts': {
+            'ownObjects': len(al_index['ownObjects']),
+            'extensionPoints': len(extension_surface),
+            'subscriptions': len(subscriptions),
+            'extensionsChanged': sum(1 for x in extension_surface if x['status'] == 'changed'),
+            'extensionsRemoved': sum(1 for x in extension_surface if x['status'] == 'removed'),
+            'extensionsNotAnalysed': sum(1 for x in extension_surface
+                                         if x['status'] == 'not-analysed'),
+            'subscriptionsIncompatible': sum(1 for x in subscriptions
+                                             if x['status'] == 'incompatible'),
+            'subscriptionsObsoleted': sum(1 for x in subscriptions
+                                          if x['status'] == 'obsoleted'),
+            'subscriptionsRemoved': sum(1 for x in subscriptions if x['status'] == 'removed'),
+            'subscriptionsNotAnalysed': sum(1 for x in subscriptions
+                                            if x['status'] == 'not-analysed'),
+        },
+    }
+
+
 BLOCKER_CAP = 0      # no cap - these must all be shown
 RETEST_CAP = 300
 OPPORTUNITY_CAP = 100
@@ -1090,6 +1369,46 @@ def render_rollup_markdown(rollup, header):
             lines.append('')
             lines.append('%d more - see business-impact.json.' % (len(rows) - len(shown)))
         lines.append('')
+
+    customization = rollup.get('customization')
+    affected = rollup.get('affectedCustomization')
+    if customization:
+        lines.append('## Our customization')
+        lines.append('')
+        lines.append('| | Total | Changed | Removed | Incompatible | Not analysed |')
+        lines.append('| --- | --- | --- | --- | --- | --- |')
+        lines.append('| Extension points | %d | %d | %d | - | %d |' % (
+            customization['extensionPoints'], customization['extensionsChanged'],
+            customization['extensionsRemoved'], customization['extensionsNotAnalysed']))
+        lines.append('| Event subscriptions | %d | - | %d | %d | %d |' % (
+            customization['subscriptions'], customization['subscriptionsRemoved'],
+            customization['subscriptionsIncompatible'],
+            customization['subscriptionsNotAnalysed']))
+        lines.append('')
+
+    if affected:
+        for label, key, columns in (
+                ('Extension points affected', 'extensionSurface',
+                 ('area', 'targetLabel', 'ourName', 'file', 'status')),
+                ('Event subscriptions affected', 'eventSubscriptions',
+                 ('area', 'hostLabel', 'event', 'file', 'status'))):
+            rows = affected[key]
+            lines.append('### %s (%d)' % (label, len(rows)))
+            lines.append('')
+            if not rows:
+                lines.append('None.')
+                lines.append('')
+                continue
+            lines.append('| %s |' % ' | '.join(columns))
+            lines.append('| %s |' % ' | '.join('---' for _ in columns))
+            for row in rows[:MAX_ITEMS]:
+                lines.append('| %s |' % ' | '.join(
+                    str(row.get(column) or '-') for column in columns))
+            if len(rows) > MAX_ITEMS:
+                lines.append('')
+                lines.append('%d more - see customization-footprint.json.'
+                             % (len(rows) - MAX_ITEMS))
+            lines.append('')
 
     lines.append('## Out of scope - counted, not listed')
     lines.append('')
@@ -1223,11 +1542,33 @@ def command_diff(args):
         'totals': {'oldObjects': 0, 'newObjects': 0},
     }
 
+    # Which objects exist in the packages that were actually compared. The delta
+    # only lists what CHANGED, so without this index a consumer cannot tell
+    # "unchanged" from "never looked at" - and for an upgrade report those two
+    # answers are worlds apart.
+    object_index = {}
+
     for key in sorted(set(current_files) & set(latest_files)):
         old = describe(current_files[key])
         new = describe(latest_files[key])
         report['totals']['oldObjects'] += len(old['objects'])
         report['totals']['newObjects'] += len(new['objects'])
+
+        for side, objects in (('new', new['objects']), ('old', old['objects'])):
+            for obj in objects.values():
+                name = (obj['name'] or '').lower()
+                if not name:
+                    continue
+                entry = object_index.get(name)
+                if entry is None:
+                    object_index[name] = {
+                        'app': key, 'kind': obj['kind'], 'id': obj['id'],
+                        'name': obj['name'], 'namespace': obj['namespace'],
+                        'caption': obj['properties'].get('Caption'),
+                        'sides': [side],
+                    }
+                elif side not in entry['sides']:
+                    entry['sides'].append(side)
 
         delta = diff_objects(old['objects'], new['objects'])
         findings = count_findings(delta)
@@ -1269,11 +1610,16 @@ def command_diff(args):
     json_path = os.path.join(args.out_dir, 'symbol-changes.json')
     markdown_path = os.path.join(args.out_dir, 'symbol-changes.md')
     summary_path = os.path.join(args.out_dir, 'summary.json')
+    index_path = os.path.join(args.out_dir, 'object-index.json')
 
     with open(json_path, 'w', encoding='utf-8') as handle:
         json.dump(report, handle, indent=1, ensure_ascii=False)
     with open(markdown_path, 'w', encoding='utf-8') as handle:
         handle.write(render_markdown(report))
+    with open(index_path, 'w', encoding='utf-8') as handle:
+        json.dump({'apps': sorted(set(current_files) & set(latest_files)),
+                   'objects': object_index}, handle, separators=(',', ':'),
+                  ensure_ascii=False)
 
     totals = Counter()
     for app in report['apps']:
@@ -1301,6 +1647,8 @@ def command_diff(args):
     print('Wrote %s' % json_path)
     print('Wrote %s' % markdown_path)
     print('Wrote %s' % summary_path)
+    print('Wrote %s (%d object name(s) across %d package(s))'
+          % (index_path, len(object_index), len(report['apps'])))
 
     github_output = os.environ.get('GITHUB_OUTPUT')
     if github_output:
@@ -1350,6 +1698,42 @@ def command_rollup(args):
         coverage_gaps = resolution.get('skipped') or []
     rollup['coverageGaps'] = coverage_gaps
 
+    # --- Our own customization, cross-referenced against the diff ------------
+    object_index = {'apps': [], 'objects': {}}
+    if args.object_index and os.path.isfile(args.object_index):
+        with open(args.object_index, encoding='utf-8') as handle:
+            object_index = json.load(handle)
+    else:
+        print('::warning::No object index (%s). Every extension point and subscription will '
+              'be reported as "not-analysed", because without it there is no way to tell an '
+              'unchanged object from one that was never compared.' % (args.object_index or '-'))
+
+    crossref = cross_reference(al_index, report, object_index)
+    rollup['customization'] = crossref['counts']
+
+    footprint = {
+        'environment': rollup['environment'],
+        'currentVersion': rollup['currentVersion'],
+        'targetVersion': rollup['targetVersion'],
+        'packagesCompared': object_index.get('apps', []),
+        'counts': crossref['counts'],
+        'ownObjects': al_index['ownObjects'],
+        'extensionSurface': crossref['extensionSurface'],
+        'eventSubscriptions': crossref['eventSubscriptions'],
+        'byFile': crossref['byFile'],
+        'coverageGaps': coverage_gaps,
+    }
+
+    # The functional report gets only what is actually affected; the full
+    # inventory lives in customization-footprint.json for the technical one.
+    affected_states = ('changed', 'removed', 'incompatible', 'obsoleted', 'not-analysed')
+    rollup['affectedCustomization'] = {
+        'extensionSurface': [x for x in crossref['extensionSurface']
+                             if x['status'] in affected_states],
+        'eventSubscriptions': [x for x in crossref['eventSubscriptions']
+                               if x['status'] in affected_states],
+    }
+
     counts = Counter(finding['severity'] for finding in rollup['findings'])
     counts['findings'] = len(rollup['findings'])
     counts['areasInScope'] = len(rollup['areas']['effective'])
@@ -1359,9 +1743,12 @@ def command_rollup(args):
     os.makedirs(args.out_dir, exist_ok=True)
     json_path = os.path.join(args.out_dir, 'business-impact.json')
     markdown_path = os.path.join(args.out_dir, 'business-impact.md')
+    footprint_path = os.path.join(args.out_dir, 'customization-footprint.json')
 
     with open(json_path, 'w', encoding='utf-8') as handle:
         json.dump(rollup, handle, indent=1, ensure_ascii=False)
+    with open(footprint_path, 'w', encoding='utf-8') as handle:
+        json.dump(footprint, handle, indent=1, ensure_ascii=False)
     with open(markdown_path, 'w', encoding='utf-8') as handle:
         handle.write(render_rollup_markdown(rollup, OrderedDict([
             ('Environment', rollup['environment']),
@@ -1385,8 +1772,21 @@ def command_rollup(args):
           % sum(rollup['outOfScopeByArea'].values()))
     print('Dropped as technical      : %d' % sum(rollup['suppressedAsTechnical'].values()))
     print('')
+    footprint_counts = crossref['counts']
+    print('--- our customization ---')
+    print('Own objects               : %d' % footprint_counts['ownObjects'])
+    print('Extension points          : %d (changed %d, removed %d, not analysed %d)'
+          % (footprint_counts['extensionPoints'], footprint_counts['extensionsChanged'],
+             footprint_counts['extensionsRemoved'], footprint_counts['extensionsNotAnalysed']))
+    print('Event subscriptions       : %d (incompatible %d, obsoleted %d, removed %d, '
+          'not analysed %d)'
+          % (footprint_counts['subscriptions'], footprint_counts['subscriptionsIncompatible'],
+             footprint_counts['subscriptionsObsoleted'], footprint_counts['subscriptionsRemoved'],
+             footprint_counts['subscriptionsNotAnalysed']))
+    print('')
     print('Wrote %s' % json_path)
     print('Wrote %s' % markdown_path)
+    print('Wrote %s' % footprint_path)
 
     github_output = os.environ.get('GITHUB_OUTPUT')
     if github_output:
@@ -1535,6 +1935,9 @@ def main():
                         help='comma-separated areas the customer uses (e.g. Sales,Finance)')
     rollup.add_argument('--resolution', default='',
                         help='resolution.json, for the coverage-gap list')
+    rollup.add_argument('--object-index', default='',
+                        help='object-index.json from "diff" - needed to tell an unchanged '
+                             'object from one that was never compared')
     rollup.add_argument('--out-dir', required=True)
     rollup.set_defaults(handler=command_rollup)
 
