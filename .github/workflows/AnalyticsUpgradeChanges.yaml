@@ -779,6 +779,51 @@ jobs:
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Metric | Value |`n| --- | --- |`n| Packages compared | $($summary.appsCompared) |`n| Objects read (old / new) | $($summary.oldObjects) / $($summary.newObjects) |`n| Breaking findings | $($summary.breaking) |`n| Data-behavior findings | $($summary.data) |`n| Obsolete findings | $($summary.obsolete) |`n| Objects removed / added | $($summary.removedObjects) / $($summary.addedObjects) |`n| Objects renamed / moved | $($summary.renamedObjects) / $($summary.movedObjects) |"
 
       # ------------------------------------------------------------------
+      # Roll the technical diff up into a functional view.
+      #
+      # The diff is Microsoft-wide - thousands of changes across the whole
+      # product, almost none of them about this customer. This step tiers every
+      # finding (does our AL code name it / is it in a business area we use /
+      # neither), keeps only consequences a user or the data can notice, and
+      # names things by their on-screen Caption. Tier 3 is counted, never
+      # listed.
+      #
+      # It is deterministic and unit-tested, which is what keeps the functional
+      # report from being a reworded copy of the technical one: the two reports
+      # are written from two different inputs.
+      # ------------------------------------------------------------------
+      - name: Roll up business impact
+        id: rollup
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+
+          $reportFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+
+          # businessAreas is declared in AL-Go-Settings.json. Areas the
+          # customization touches are derived from the AL source; this list adds
+          # the areas the customer uses WITHOUT customization, which still need
+          # UAT. Without it the report under-reports: a customer can run
+          # Finance heavily while the code names a single VAT setup table.
+          $settings = $env:Settings | ConvertFrom-Json
+          $businessAreas = ''
+          if ($settings.PSObject.Properties.Name -contains 'businessAreas' -and $settings.businessAreas) {
+            $businessAreas = (@($settings.businessAreas) -join ',')
+            Write-Host "businessAreas (settings): $businessAreas"
+          }
+          else {
+            Write-Host "::warning::No 'businessAreas' in AL-Go-Settings.json. The functional report will only cover areas the customization itself touches, and will miss upgrade changes in areas the customer uses without customization."
+          }
+
+          python .github/scripts/diff_symbols.py rollup `
+            --changes (Join-Path $reportFolder 'symbol-changes.json') `
+            --al-source 'ALGo-App' `
+            --business-areas "$businessAreas" `
+            --resolution (Join-Path $reportFolder 'resolution.json') `
+            --out-dir "$reportFolder"
+          if ($LASTEXITCODE -ne 0) { throw "The business rollup failed (exit code $LASTEXITCODE)." }
+
+      # ------------------------------------------------------------------
       # Copilot turns the mechanical diff into an impact assessment scoped to
       # our own AL source.
       #
@@ -815,19 +860,26 @@ jobs:
           $deltaJsonFile = Join-Path $reportFolder 'symbol-changes.json'
           $summaryFile = Join-Path $reportFolder 'summary.json'
           $resolutionFile = Join-Path $reportFolder 'resolution.json'
-          $reportFile = Join-Path $reportFolder 'copilot-analysis.md'
+          $businessJsonFile = Join-Path $reportFolder 'business-impact.json'
+          $technicalReportFile = Join-Path $reportFolder 'technical-analysis.md'
+          $functionalReportFile = Join-Path $reportFolder 'functional-impact.md'
           $stdoutFile = Join-Path $reportFolder 'copilot-stdout.txt'
           $stderrFile = Join-Path $reportFolder 'copilot-stderr.log'
 
           if (!$env:COPILOT_GITHUB_TOKEN) {
-            Write-Host "::warning::Secret COPILOT_GITHUB_TOKEN is not set - the structured diff is in the artifact, but no impact analysis was produced."
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis`n`nSkipped - COPILOT_GITHUB_TOKEN is not available to this job."
+            Write-Host "::warning::Secret COPILOT_GITHUB_TOKEN is not set - the structured diff and the mechanical rollup are in the artifact, but neither narrative report was produced."
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Analysis`n`nSkipped - COPILOT_GITHUB_TOKEN is not available to this job. business-impact.md in the artifact holds the mechanical functional rollup."
             return
           }
 
-          $instructionFile = Join-Path $env:GITHUB_WORKSPACE 'ALGo-App/Instructions/Compare-instruction.md'
-          if (!(Test-Path $instructionFile)) {
-            throw "$instructionFile not found. It is the format contract for this report - refusing to invent a layout."
+          # Each report has its own format contract, owned by the people who
+          # read it. Neither layout is hard-coded here.
+          $technicalInstructionFile = Join-Path $env:GITHUB_WORKSPACE 'ALGo-App/Instructions/Compare-instruction.md'
+          $functionalInstructionFile = Join-Path $env:GITHUB_WORKSPACE 'ALGo-App/Instructions/Functional-impact-instruction.md'
+          foreach($file in @($technicalInstructionFile, $functionalInstructionFile)) {
+            if (!(Test-Path $file)) {
+              throw "$file not found. It is the format contract for one of the two reports - refusing to invent a layout."
+            }
           }
 
           Write-Host "Installing Copilot CLI ($($env:copilotVersion))"
@@ -842,18 +894,28 @@ jobs:
           environment is upgraded. Base your answer only on the files in this repository and the
           input files listed below - never on recalled Business Central internals.
 
+          You will produce TWO SEPARATE REPORTS for TWO DIFFERENT AUDIENCES, written from TWO
+          DIFFERENT INPUTS, and you will WRITE THEM TO DISK yourself:
+
+            1. $technicalReportFile   - for developers
+            2. $functionalReportFile  - for functional consultants
+
           Input files:
-          - $deltaMarkdownFile : readable diff of the Microsoft symbols between the version
-            running on $($env:environmentName) ($($env:currentVersion), the old version) and the
-            target version ($($env:targetVersion), the new version). Truncated for readability.
-          - $deltaJsonFile : the same diff, complete and unabridged, including normalised method
-            signatures, parameter lists, var-ness, visibility flags, enum ordinals and field
-            properties. Read or grep this whenever the markdown summary truncated what you need.
+          - $deltaJsonFile : the complete technical diff of the Microsoft symbols between the
+            version running on $($env:environmentName) ($($env:currentVersion), the old version)
+            and the target version ($($env:targetVersion), the new version). Includes normalised
+            method signatures, parameter lists, var-ness, visibility flags, enum ordinals and
+            field properties. THIS IS THE INPUT FOR THE TECHNICAL REPORT.
+          - $deltaMarkdownFile : the same diff, readable but truncated.
+          - $businessJsonFile : the functional rollup, produced from the diff by
+            .github/scripts/diff_symbols.py rollup. Already filtered to consequences a user or
+            the data can notice, already tiered by whether our code or our business areas are
+            involved, and already carrying the on-screen Caption of every object.
+            THIS IS THE INPUT FOR THE FUNCTIONAL REPORT.
           - $summaryFile : headline counts for the whole run.
           - $resolutionFile : which feed build was used for each package, and which packages
             could not be compared.
-          - $($env:currentFolder) and $($env:targetFolder) : the raw .app symbol packages the
-            diff was computed from.
+          - $($env:currentFolder) and $($env:targetFolder) : the raw .app symbol packages.
           - ALGo-App/ : the AL source of our own app, including app.json and its dependencies.
 
           FIRST, a reconciliation pass. The diff was produced by
@@ -864,41 +926,66 @@ jobs:
           - If any package reports zero objects, or the counts look implausible, unpack that
             .app yourself (it is a 40-byte header followed by a zip; objects live nested inside
             "Namespaces" in SymbolReference.json), count what is really there, and REPORT THE
-            INCONSISTENCY at the top of your answer instead of drawing conclusions from it.
-          - State explicitly in section 1 that this check was carried out and what it found.
+            INCONSISTENCY at the top of BOTH reports instead of drawing conclusions from it.
 
-          OUTPUT FORMAT - MANDATORY. Read $instructionFile; it is the format contract.
+          === REPORT 1: $technicalReportFile ===
+
+          Read $technicalInstructionFile; it is the format contract for this report.
           - PHASE 1 (extraction) and PHASE 2 (structured diff) have already been carried out by
             this workflow, subject to the reconciliation above.
           - Apply PHASE 3 (breaking-change classification) to the diff, using its rules as
             written. The diff already carries a mechanical 'category' per finding (breaking /
-            data / obsolete / additive) - treat it as a first pass to be checked, not as a
-            verdict.
-          - Emit the report in the PHASE 4 skeleton (sections 1-7 plus "Conclusion & action
-            items"), omitting any section with no data rather than writing "nothing here".
-          - Obey the section 5 WRITING RULES and run the section 6 SELF-CHECK before answering.
-
-          Deviations from the instruction file that apply to this run:
-          - Section 1 "Metadata": report the environment name, the version on the environment
+            data / obsolete / additive) - treat it as a first pass to be checked, not a verdict.
+          - Emit the PHASE 4 skeleton (sections 1-7 plus "Conclusion & action items"), omitting
+            any section with no data rather than writing "nothing here".
+          - Obey the section 5 WRITING RULES and run the section 6 SELF-CHECK.
+          - Section 1 "Metadata": the environment name, the version on the environment
             ($($env:currentVersion), old), the target version ($($env:targetVersion), new), the
             per-package old -> new versions, and the outcome of the reconciliation pass. There
             is no manifest or compiler data in these inputs - omit those rows.
           - Sections 3 and 6 must be scoped to our own app first: for every breaking or
-            data-behavior change, state whether the AL code in ALGo-App/ actually references
-            that object or member, and give the AL file and line when it does. Say so
-            explicitly when nothing in ALGo-App/ is affected.
+            data-behavior change, state whether the AL code in ALGo-App/ references that object
+            or member, and give the AL file and line when it does. Say so explicitly when
+            nothing in ALGo-App/ is affected.
           - Objects that only moved namespace or were renamed keep their Id and are NOT
             removals. Do not report them as breaking unless our code qualifies them by
             namespace.
-          - Add a "### 8. New capabilities worth adopting" section before the conclusion:
-            additions in the new version that would let us simplify or replace code we
-            currently maintain in ALGo-App/.
+          - Add a "### 8. New capabilities worth adopting" section before the conclusion.
           - The closing checklist must name any required app.json platform, application or
             dependency version bump.
-          - Packages listed as not compared in $resolutionFile are blind spots. List them in
-            the conclusion as unreviewed - never present the report as complete coverage.
+          - Packages listed as not compared in $resolutionFile are blind spots; list them in
+            the conclusion as unreviewed.
 
-          Output the markdown report and nothing else.
+          === REPORT 2: $functionalReportFile ===
+
+          Read $functionalInstructionFile; it is the format contract for this report, and it
+          sets the output language.
+
+          THIS IS NOT A SHORTER VERSION OF REPORT 1. It is a different document for a different
+          reader, and these rules are absolute:
+          - Write it from $businessJsonFile. Do not read findings out of $deltaJsonFile for
+            this report - that file is already summarised for you, filtered, tiered and
+            translated into on-screen names. Anything not in $businessJsonFile does not belong
+            in this report.
+          - Use ALGo-App/ only to answer "does our customization use this" and "could this new
+            standard feature replace something we maintain".
+          - Name every object by its 'objectLabel' - the Caption the user sees on screen -
+            never by its object name and never by its Id.
+          - BANNED VOCABULARY. Section 3 of $functionalInstructionFile carries a
+            "banned-vocabulary" block; none of those words may appear in
+            $functionalReportFile. Examples from it: signature, namespace, ordinal,
+            IntegrationEvent, ObsoleteState. Read the block for the full list - it is the
+            authoritative one, and the workflow greps this file against it after you finish.
+            Where the underlying fact is technical, state the business consequence and say
+            that a developer must act - the instruction file's wording table shows how.
+          - Obey its section 3 WRITING RULES, use its section 4 wording table, emit its
+            section 5 structure, and run its section 6 SELF-CHECK before writing the file.
+
+          === HOW TO FINISH ===
+
+          Write both files to the paths given above using your file-writing tool. Then print a
+          two-line confirmation to stdout - one line per file, with its path and its size - and
+          nothing else. Do not print the reports themselves to stdout.
           "@
 
           Write-Host "Running Copilot ($($env:copilotModel))"
@@ -914,23 +1001,77 @@ jobs:
 
           $output = ''
           if (Test-Path $stdoutFile) { $output = Get-Content -Path $stdoutFile -Raw -Encoding UTF8 }
-          if ($exitCode -ne 0 -or !$output) {
-            Write-Host "::warning::Copilot exited with code $exitCode - see copilot-stderr.log in the artifact. The structured diff is unaffected."
-            return
+          Write-Host "--- copilot stdout ---"
+          Write-Host $output
+
+          # The two reports are expected on disk. Falling back to stdout covers
+          # the case where the model answered in the chat instead of writing
+          # files - better a report in the wrong shape than no report.
+          $missing = @($technicalReportFile, $functionalReportFile | Where-Object { !(Test-Path $_) })
+          if ($missing.Count -eq 2 -and $output) {
+            Write-Host "::warning::Neither report file was written; keeping the stdout answer as the technical report. The functional report is missing - business-impact.md in the artifact holds the mechanical rollup."
+            Set-Content -Encoding UTF8 -Path $technicalReportFile -Value $output
+          }
+          elseif ($missing.Count -gt 0) {
+            Write-Host "::warning::$($missing.Count) of the 2 reports were not written: $($missing -join ', ')."
           }
 
-          Set-Content -Encoding UTF8 -Path $reportFile -Value $output
-          Write-Host "Wrote $reportFile"
+          if ($exitCode -ne 0) {
+            Write-Host "::warning::Copilot exited with code $exitCode - see copilot-stderr.log in the artifact. The structured diff and the mechanical rollup are unaffected."
+          }
 
-          # GITHUB_STEP_SUMMARY is capped at 1 MB - keep the summary readable and
-          # leave the full report to the artifact.
-          $summaryText = $output
+          foreach($file in @($technicalReportFile, $functionalReportFile)) {
+            if (Test-Path $file) {
+              Write-Host "Wrote $file ($([Math]::Round((Get-Item $file).Length / 1KB, 1)) KB)"
+            }
+          }
+
+          # The functional report goes in the job summary: it is the shorter one
+          # and it has the wider readership. The technical report stays in the
+          # artifact, where the developers who need it will look.
+          # GITHUB_STEP_SUMMARY is capped at 1 MB.
           $limit = 60000
-          if ($summaryText.Length -gt $limit) {
-            $summaryText = $summaryText.Substring(0, $limit) + "`n`n_(truncated - the full report is copilot-analysis.md in the artifact)_"
+          if (Test-Path $functionalReportFile) {
+            $functionalText = Get-Content -Path $functionalReportFile -Raw -Encoding UTF8
+            if ($functionalText.Length -gt $limit) {
+              $functionalText = $functionalText.Substring(0, $limit) + "`n`n_(truncated - the full report is functional-impact.md in the artifact)_"
+            }
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $functionalText
           }
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis: $($env:currentVersion) -> $($env:targetVersion)`n"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $summaryText
+          if (Test-Path $technicalReportFile) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n`n_The technical report for developers is technical-analysis.md in the ``upgrade-analysis-$($env:ALGoEnvName)`` artifact._"
+          }
+
+      # ------------------------------------------------------------------
+      # Check the functional report against its own contract.
+      #
+      # Both reports come out of a single analysis pass, so nothing structurally
+      # stops the functional one from drifting into developer language. This
+      # step greps it against the banned-vocabulary and required-sections blocks
+      # in its instruction file, and compares it against the technical report to
+      # catch a near-copy. It warns rather than fails: a report that leaked
+      # jargon is still worth having, and the warning tells whoever owns the
+      # contract what to tighten.
+      # ------------------------------------------------------------------
+      - name: Check report separation
+        id: checkReports
+        if: ${{ always() && !inputs.skipCopilot }}
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+
+          $reportFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+          $functionalReportFile = Join-Path $reportFolder 'functional-impact.md'
+          $technicalReportFile = Join-Path $reportFolder 'technical-analysis.md'
+
+          python .github/scripts/diff_symbols.py checkreport `
+            --report "$functionalReportFile" `
+            --instruction 'ALGo-App/Instructions/Functional-impact-instruction.md' `
+            --compare-with "$technicalReportFile"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::The report check exited with code $LASTEXITCODE."
+          }
 
       - name: Upload report
         if: always()

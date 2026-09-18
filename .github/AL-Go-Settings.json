@@ -18,6 +18,18 @@
     ]
   },
   "TEST-AuthContextSecretName": "ALGOPROJECTAPP_AUTHCONTEXT",
+  "_businessAreas": "Business areas the customer uses, for the functional upgrade report (AnalyticsUpgradeChanges workflow). Areas the customization touches are derived from the AL source automatically; list here the ones the customer uses WITHOUT customization - they still need UAT. Values are Business Central namespace segments; diff_symbols.py rollup warns on any name it cannot find.",
+  "businessAreas": [
+    "Sales",
+    "Service",
+    "Integration",
+    "Inventory",
+    "Purchases",
+    "Foundation",
+    "Warehouse",
+    "Finance",
+    "Bank"
+  ],
   "DeployToPROD": {
     "EnvironmentName": "Production",
     "continuousDeployment": false

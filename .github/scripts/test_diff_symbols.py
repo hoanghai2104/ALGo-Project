@@ -10,10 +10,10 @@ regression shows up here instead of as a silently empty upgrade report.
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import zipfile
-
-import sys
 
 import diff_symbols as ds
 
@@ -369,6 +369,343 @@ print('\nNo-change case')
 identical = ds.diff_objects(ds.flatten(base_tree()), ds.flatten(base_tree()))
 check('identical trees produce no findings',
       not any(identical[k] for k in identical), '(got %r)' % identical)
+
+print('\nBusiness rollup - namespace to business area')
+
+check('Microsoft.Sales.Document -> Sales', ds.area_of('Microsoft.Sales.Document') == 'Sales')
+check('Microsoft.Inventory.Ledger -> Inventory',
+      ds.area_of('Microsoft.Inventory.Ledger') == 'Inventory')
+check('System.* collapses into Platform', ds.area_of('System.Security.AccessControl') == 'Platform')
+check('an empty namespace is Unclassified', ds.area_of('') == 'Unclassified')
+
+
+def al_index(objects=None, events=None, members=None, files=1):
+    """Stand in for a scan of our AL source."""
+    return {
+        'objects': {name: [{'file': 'Src/X.al', 'line': 10, 'how': 'record'}]
+                    for name in (objects or [])},
+        'events': {key: [{'file': 'Src/X.al', 'line': 20, 'how': 'subscriber'}]
+                   for key in (events or [])},
+        'members': {name: [{'file': 'Src/X.al', 'line': 30, 'how': 'member'}]
+                    for name in (members or [])},
+        'alFiles': files,
+    }
+
+
+def wrap(**delta):
+    base = {'removedObjects': [], 'addedObjects': [], 'renamedObjects': [],
+            'movedObjects': [], 'changedObjects': []}
+    base.update(delta)
+    return {'apps': [{'app': 'Microsoft/Base Application', 'oldVersion': '27.0.0.0',
+                      'newVersion': '28.0.0.0', 'delta': base}]}
+
+
+def obj(kind='Tables', name='Sales Header', ns='Microsoft.Sales.Document',
+        caption=None, oid=36):
+    return {'key': '%s/%s' % (kind, oid), 'kind': kind, 'id': oid, 'name': name,
+            'namespace': ns, 'caption': caption}
+
+
+def changed(props=None, removed_members=None, changed_members=None, **kw):
+    entry = obj(**kw)
+    entry.update({'propertyChanges': props or [], 'removedMembers': removed_members or [],
+                  'addedMembers': [], 'changedMembers': changed_members or []})
+    return entry
+
+
+def only(rollup, severity=None):
+    return [f for f in rollup['findings'] if severity is None or f['severity'] == severity]
+
+
+print('\nBusiness rollup - technical noise is dropped, not explained')
+
+roll = ds.build_rollup(
+    wrap(renamedObjects=[{'key': 'Tables/36', 'kind': 'Tables', 'id': 36,
+                          'namespace': 'Microsoft.Sales.Document', 'name': 'Sales Hdr',
+                          'oldName': 'Sales Header', 'newName': 'Sales Hdr'}],
+         movedObjects=[{'key': 'Tables/5900', 'kind': 'Tables', 'id': 5900,
+                        'name': 'Service Header', 'namespace': 'Microsoft.Service.Document',
+                        'oldNamespace': 'Microsoft.Service',
+                        'newNamespace': 'Microsoft.Service.Document'}]),
+    al_index(objects=['Sales Header', 'Service Header']), ['Sales'])
+check('renames and namespace moves produce no functional finding', not roll['findings'])
+check('they are counted as considered-and-dropped',
+      roll['suppressedAsTechnical'].get('renamed') == 1
+      and roll['suppressedAsTechnical'].get('moved') == 1)
+check('a rename/move still counts toward the footprint, under a real area',
+      roll['areas']['derivedFromCode'] == ['Sales', 'Service'],
+      '(got %r)' % roll['areas']['derivedFromCode'])
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(props=[{'property': 'DataCaptionFields', 'old': 'a',
+                                         'new': 'b', 'category': 'info'}])]),
+    al_index(objects=['Sales Header']), ['Sales'])
+check('a purely technical property change is dropped',
+      not roll['findings'] and roll['suppressedAsTechnical'].get('technical-property') == 1)
+
+print('\nBusiness rollup - tiering')
+
+removed_page = obj(kind='Pages', name='Sales Order List', caption='Sales Orders', oid=9305)
+
+roll = ds.build_rollup(wrap(removedObjects=[removed_page]),
+                       al_index(objects=['Sales Order List']), [])
+found = only(roll, 'blocker')
+check('tier 1: removal of something our code names is a blocker', len(found) == 1)
+check('tier 1: the AL file and line are carried',
+      found and found[0]['references'] and found[0]['references'][0]['file'] == 'Src/X.al')
+check('tier 1: the area is derived from the code, with nothing declared',
+      roll['areas']['derivedFromCode'] == ['Sales'])
+
+roll = ds.build_rollup(wrap(removedObjects=[removed_page]), al_index(), ['Sales'])
+check('tier 2: a declared area brings in a removal we do not reference',
+      len(only(roll, 'blocker')) == 1)
+check('tier 2: it is marked as not used by our app',
+      only(roll, 'blocker')[0]['usedByCustomization'] is False)
+
+roll = ds.build_rollup(wrap(removedObjects=[removed_page]), al_index(), ['Finance'])
+check('tier 3: out of scope produces no finding, only a count',
+      not roll['findings'] and roll['outOfScopeByArea'].get('Sales') == 1)
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(kind='Tables', name='VAT Posting Setup',
+                                 ns='Microsoft.Finance.VAT', oid=325,
+                                 props=[{'property': 'Permissions', 'old': 'r',
+                                         'new': 'rm', 'category': 'data'}])]),
+    al_index(), ['Finance'])
+check('a declared area widens scope where the code has no footprint',
+      len(only(roll, 'retest')) == 1 and roll['areas']['declared'] == ['Finance'])
+
+print('\nBusiness rollup - user-visible label and consequence')
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(
+        caption='Sales Header',
+        removed_members=[{'name': 'Technician Name', 'signature': 'Technician Name: Text[50]',
+                          'caption': 'Technician'}])]),
+    al_index(objects=['Sales Header'], members=['Technician Name']), ['Sales'])
+found = only(roll, 'blocker')
+check('a removed field is a blocker', len(found) == 1
+      and found[0]['consequenceCode'] == 'field-removed')
+check('the field Caption is what gets reported',
+      found and found[0]['facts']['memberLabel'] == 'Technician')
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(changed_members=[
+        {'name': 'Amount', 'caption': 'Amount', 'old': 'a', 'new': 'b',
+         'category': 'data', 'reasons': ['CalcFormula x -> y']}])]),
+    al_index(objects=['Sales Header']), ['Sales'])
+found = only(roll, 'retest')
+check('a CalcFormula change is re-test, not a blocker',
+      len(found) == 1 and found[0]['consequenceCode'] == 'calcformula-changed')
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(changed_members=[
+        {'name': 'No.', 'caption': 'No.', 'old': 'a', 'new': 'b',
+         'category': 'breaking', 'reasons': ['type Code[20] -> Code[50]']}])]),
+    al_index(objects=['Sales Header']), ['Sales'])
+found = only(roll, 'blocker')
+check('a field type change is a blocker',
+      len(found) == 1 and found[0]['consequenceCode'] == 'field-type-changed')
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(props=[{'property': 'Caption', 'old': 'Sales Order',
+                                         'new': 'Sales Document', 'category': 'ui'}])]),
+    al_index(objects=['Sales Header']), ['Sales'])
+check('a caption change is re-test (documentation and training)',
+      len(only(roll, 'retest')) == 1)
+
+print('\nBusiness rollup - methods are shown only where our code uses them')
+
+method_change = {'name': 'OnBeforePostSalesDoc', 'caption': None, 'old': 'a(x)', 'new': 'a(x; y)',
+                 'category': 'breaking', 'reasons': ['parameter list changed in place']}
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(kind='Codeunits', name='Sales-Post', oid=80,
+                                 changed_members=[method_change])]),
+    al_index(), ['Sales'])
+check('a changed method we do not use is dropped, even in a declared area',
+      not roll['findings'] and roll['suppressedAsTechnical'].get('method-not-used') == 1)
+
+roll = ds.build_rollup(
+    wrap(changedObjects=[changed(kind='Codeunits', name='Sales-Post', oid=80,
+                                 changed_members=[method_change])]),
+    al_index(objects=['Sales-Post'], events=[('Sales-Post', 'OnBeforePostSalesDoc')]), ['Sales'])
+found = only(roll, 'blocker')
+check('a changed integration point we subscribe to is a blocker',
+      len(found) == 1 and found[0]['consequenceCode'] == 'integration-point-changed')
+
+print('\nBusiness rollup - additions')
+
+new_page = obj(kind='Pages', name='Reminder Automation Card',
+               caption='Reminder Automation', ns='Microsoft.Sales.Reminder', oid=6000)
+
+roll = ds.build_rollup(wrap(addedObjects=[new_page]), al_index(), ['Sales'])
+found = only(roll, 'opportunity')
+check('a new screen in an area we use is an opportunity',
+      len(found) == 1 and found[0]['objectLabel'] == 'Reminder Automation')
+
+roll = ds.build_rollup(wrap(addedObjects=[new_page]), al_index(), ['Finance'])
+check('a new screen outside our scope is not reported', not only(roll, 'opportunity'))
+
+roll = ds.build_rollup(
+    wrap(addedObjects=[obj(kind='Codeunits', name='Reminder Impl', oid=6001,
+                           ns='Microsoft.Sales.Reminder')]),
+    al_index(), ['Sales'])
+check('a new codeunit is not an opportunity a consultant can act on',
+      not roll['findings'])
+
+print('\nBusiness rollup - the markdown fallback renders')
+
+roll = ds.build_rollup(
+    wrap(removedObjects=[removed_page],
+         addedObjects=[new_page],
+         changedObjects=[changed(changed_members=[
+             {'name': 'Amount', 'caption': 'Amount', 'old': 'a', 'new': 'b',
+              'category': 'data', 'reasons': ['CalcFormula x -> y']}])]),
+    al_index(objects=['Sales Header']), ['Sales'])
+text = ds.render_rollup_markdown(roll, {'Environment': 'Sandbox'})
+check('every severity section is rendered',
+      'Must be handled before the upgrade (1)' in text
+      and 'Needs re-testing (1)' in text
+      and 'New standard capability (1)' in text)
+check('the fallback names things by Caption, not by object name',
+      'Sales Orders' in text and 'Sales Order List' not in text)
+
+print('\nReport check - the contract a consultant edits is the one enforced')
+
+INSTRUCTION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           '..', '..', 'ALGo-App', 'Instructions',
+                           'Functional-impact-instruction.md')
+INSTRUCTION = os.path.normpath(INSTRUCTION)
+
+check('the functional instruction file exists', os.path.isfile(INSTRUCTION),
+      '(looked for %s)' % INSTRUCTION)
+
+if os.path.isfile(INSTRUCTION):
+    with open(INSTRUCTION, encoding='utf-8') as handle:
+        contract = handle.read()
+    banned = ds.parse_fenced_list(contract, 'banned-vocabulary')
+    required = ds.parse_fenced_list(contract, 'required-sections')
+    check('the banned-vocabulary block is read from the real contract',
+          'namespace' in banned and 'ObsoleteState' in banned,
+          '(got %r)' % banned)
+    check('the required-sections block is read from the real contract',
+          len(required) >= 3, '(got %r)' % required)
+else:
+    banned, required = [], []
+
+check('a missing block yields an empty list, not a crash',
+      ds.parse_fenced_list('no blocks here', 'banned-vocabulary') == [])
+
+
+class Args(object):
+    def __init__(self, report, instruction, compare_with=''):
+        self.report = report
+        self.instruction = instruction
+        self.compare_with = compare_with
+
+
+def run_check(report_text, compare_text=None):
+    report_path = write_temp(report_text.encode('utf-8'), suffix='.md')
+    compare_path = ''
+    if compare_text is not None:
+        compare_path = write_temp(compare_text.encode('utf-8'), suffix='.md')
+    buffer = io.StringIO()
+    saved = sys.stdout
+    sys.stdout = buffer
+    try:
+        ds.command_checkreport(Args(report_path, INSTRUCTION, compare_path))
+    finally:
+        sys.stdout = saved
+        os.unlink(report_path)
+        if compare_path:
+            os.unlink(compare_path)
+    return buffer.getvalue()
+
+
+CLEAN_REPORT = """# Đánh giá tác động nghiệp vụ
+
+## Kết luận
+Hai điểm phải xử lý trước khi nâng cấp.
+
+## Phải xử lý trước khi nâng cấp (1)
+| # | Ảnh hưởng nghiệp vụ | Vùng |
+| 1 | Trường "Technician" trên Sales Header bị bỏ | Sales |
+
+## Cần kiểm thử lại (1)
+| # | Quy trình cần kiểm thử | Vì sao |
+| 1 | Tạo và post Sales Order | Cách tính thay đổi |
+
+## Phạm vi đã xét
+Sales, Service, Finance.
+"""
+
+output = run_check(CLEAN_REPORT)
+check('a clean report reports no banned vocabulary',
+      'no banned vocabulary found' in output, '(got %r)' % output[-300:])
+check('a clean report reports all sections present',
+      'all required sections present' in output)
+
+output = run_check(CLEAN_REPORT.replace('Trường "Technician"',
+                                        'The namespace of the codeunit signature'))
+check('leaked developer vocabulary is reported',
+      '::warning::' in output and 'namespace' in output)
+check('the leak report gives a line number', 'first at line' in output)
+
+output = run_check(CLEAN_REPORT.replace('## Kết luận', '## Tóm tắt'))
+check('a missing required section is reported',
+      'missing' in output and 'Kết luận' in output)
+
+output = run_check(CLEAN_REPORT, CLEAN_REPORT)
+check('a functional report identical to the technical one is reported',
+      'looks like a copy' in output, '(got %r)' % output[-400:])
+
+output = run_check(CLEAN_REPORT, '# Technical\n\nSomething entirely different and long enough.\n')
+check('two genuinely different reports pass the copy check',
+      'looks like a copy' not in output)
+
+output = run_check(CLEAN_REPORT + '\n', None)
+check('the copy check is skipped when there is nothing to compare with',
+      'overlap with' not in output)
+
+missing_path = os.path.join(os.path.dirname(INSTRUCTION), 'does-not-exist.md')
+buffer = io.StringIO()
+saved = sys.stdout
+sys.stdout = buffer
+try:
+    code = ds.command_checkreport(Args(missing_path, INSTRUCTION))
+finally:
+    sys.stdout = saved
+check('an unwritten report is a warning, not a failure',
+      code == 0 and 'was not written' in buffer.getvalue())
+
+print('\nReport check - non-ASCII output survives a legacy console codepage')
+
+# The section headings in the contract are Vietnamese. On Windows, Python writes
+# a redirected stdout in the locale codepage, so printing them raised
+# UnicodeEncodeError and failed the workflow step. Redirecting stdout to a
+# StringIO inside this process cannot catch that, so run the real script the way
+# the workflow does, with a legacy codepage forced.
+bad_report = write_temp(
+    '# Report\n\n## Tong ket\n\nNothing here matches the contract.\n'.encode('utf-8'),
+    suffix='.md')
+try:
+    environment = dict(os.environ)
+    environment['PYTHONIOENCODING'] = 'cp1252'
+    environment.pop('GITHUB_OUTPUT', None)
+    completed = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      'diff_symbols.py'),
+         'checkreport', '--report', bad_report, '--instruction', INSTRUCTION],
+        env=environment, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    check('a report missing Vietnamese sections does not crash on cp1252',
+          completed.returncode == 0,
+          '(exit %s, stderr tail: %r)' % (completed.returncode, completed.stderr[-300:]))
+    check('the missing-section warning is still emitted',
+          'missing' in completed.stdout,
+          '(stdout: %r)' % completed.stdout[-300:])
+finally:
+    os.unlink(bad_report)
 
 print('')
 if FAILURES:

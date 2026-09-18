@@ -32,6 +32,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 from collections import Counter, OrderedDict
@@ -374,10 +375,15 @@ def diff_properties(old, new):
 def diff_members(old_members, new_members, member_kind):
     removed, added, changed = [], [], []
 
+    def member_caption(member):
+        return (member.get('properties') or {}).get('Caption')
+
     for name in sorted(set(old_members) - set(new_members)):
-        removed.append({'name': name, 'signature': old_members[name]['signature']})
+        removed.append({'name': name, 'signature': old_members[name]['signature'],
+                        'caption': member_caption(old_members[name])})
     for name in sorted(set(new_members) - set(old_members)):
-        added.append({'name': name, 'signature': new_members[name]['signature']})
+        added.append({'name': name, 'signature': new_members[name]['signature'],
+                      'caption': member_caption(new_members[name])})
 
     for name in sorted(set(old_members) & set(new_members)):
         old, new = old_members[name], new_members[name]
@@ -386,6 +392,7 @@ def diff_members(old_members, new_members, member_kind):
 
         entry = {
             'name': name,
+            'caption': member_caption(new),
             'old': old['signature'],
             'new': new['signature'],
         }
@@ -437,26 +444,34 @@ def diff_objects(old_objects, new_objects):
         result['removedObjects'].append({
             'key': key, 'kind': obj['kind'], 'id': obj['id'],
             'name': obj['name'], 'namespace': obj['namespace'],
+            'caption': obj['properties'].get('Caption'),
         })
     for key in sorted(set(new_objects) - set(old_objects)):
         obj = new_objects[key]
         result['addedObjects'].append({
             'key': key, 'kind': obj['kind'], 'id': obj['id'],
             'name': obj['name'], 'namespace': obj['namespace'],
+            'caption': obj['properties'].get('Caption'),
         })
 
     for key in sorted(set(old_objects) & set(new_objects)):
         old, new = old_objects[key], new_objects[key]
 
+        # 'oldName'/'newName' and 'oldNamespace'/'newNamespace' rather than a
+        # shared 'old'/'new': the two collections would otherwise use the same
+        # field names for different things, which is how a consumer ends up
+        # reading a namespace as an object name.
         if old['name'] != new['name']:
             result['renamedObjects'].append({
                 'key': key, 'kind': old['kind'], 'id': old['id'],
-                'old': old['name'], 'new': new['name'],
+                'namespace': new['namespace'], 'name': new['name'],
+                'oldName': old['name'], 'newName': new['name'],
             })
         if old['namespace'] != new['namespace']:
             result['movedObjects'].append({
                 'key': key, 'kind': old['kind'], 'id': old['id'], 'name': new['name'],
-                'old': old['namespace'], 'new': new['namespace'],
+                'namespace': new['namespace'],
+                'oldNamespace': old['namespace'], 'newNamespace': new['namespace'],
             })
 
         property_changes = diff_properties(old['properties'], new['properties'])
@@ -472,6 +487,10 @@ def diff_objects(old_objects, new_objects):
             'id': old['id'],
             'name': new['name'],
             'namespace': new['namespace'],
+            # The user-facing name. Present on 98% of pages and reports and 92%
+            # of tables, so a report can say "Posted Sales Invoices" instead of
+            # "Sales Invoice List".
+            'caption': new['properties'].get('Caption'),
             'propertyChanges': property_changes,
             'removedMembers': removed,
             'addedMembers': added,
@@ -562,7 +581,7 @@ def render_markdown(report):
         if delta['renamedObjects']:
             lines.append('### Renamed objects - %d' % len(delta['renamedObjects']))
             lines.append(format_list([
-                '%s %s: "%s" -> "%s"' % (o['kind'], o['id'], o['old'], o['new'])
+                '%s %s: "%s" -> "%s"' % (o['kind'], o['id'], o['oldName'], o['newName'])
                 for o in delta['renamedObjects']
             ]))
             lines.append('')
@@ -572,7 +591,8 @@ def render_markdown(report):
             lines.append('These are not removals - the object Id is unchanged.')
             lines.append('')
             lines.append(format_list([
-                '%s %s "%s": %s -> %s' % (o['kind'], o['id'], o['name'], o['old'] or '<root>', o['new'])
+                '%s %s "%s": %s -> %s' % (o['kind'], o['id'], o['name'],
+                                          o['oldNamespace'] or '<root>', o['newNamespace'])
                 for o in delta['movedObjects']
             ]))
             lines.append('')
@@ -646,6 +666,444 @@ def render_markdown(report):
     lines.append('---')
     lines.append('')
     lines.append('The complete, untruncated diff is in symbol-changes.json.')
+    return '\n'.join(lines)
+
+
+# --------------------------------------------------------------------------
+# Business rollup - a functional view over the technical diff
+#
+# The diff is Microsoft-wide: for a major upgrade it holds thousands of changes
+# across the whole product, and 95% of them concern areas a given customer never
+# touches. Handing that to a functional consultant is worse than handing them
+# nothing. So every finding is placed in one of three tiers and only the first
+# two are ever enumerated:
+#
+#   tier 1  the AL source in this repository actually references it
+#   tier 2  it sits in a business area we use (derived from tier 1, plus the
+#           businessAreas setting - a customer can use Finance heavily with zero
+#           customisation there, and an upgrade change still needs UAT)
+#   tier 3  everything else - counted per area, never listed
+#
+# Findings are also filtered by consequence: only things a user or the data can
+# actually notice survive. Namespace moves, renames that keep the Id, internal
+# visibility changes and attribute churn are technical facts with no functional
+# meaning, and are dropped here rather than being explained away in prose.
+#
+# Wording is deliberately NOT produced here. Each finding carries a
+# consequenceCode and the facts behind it; the report's instruction file owns
+# the sentence and the language, so a consultant can change either without
+# touching this script.
+# --------------------------------------------------------------------------
+
+# Object kinds a user meets in the product, versus kinds that are pure plumbing.
+USER_FACING_KINDS = {
+    'Pages': 'screen',
+    'PageExtensions': 'screen',
+    'PageCustomizations': 'screen',
+    'Reports': 'report',
+    'ReportExtensions': 'report',
+    'Tables': 'data',
+    'TableExtensions': 'data',
+    'EnumTypes': 'choice-list',
+    'EnumExtensionTypes': 'choice-list',
+    'Profiles': 'role-centre',
+    'ProfileExtensions': 'role-centre',
+    'PermissionSets': 'permissions',
+    'PermissionSetExtensions': 'permissions',
+}
+
+# Consequences that stop something working, versus ones that change how it
+# behaves, versus additions. Keyed by consequenceCode.
+BLOCKER_CODES = {
+    'object-removed', 'object-obsoleted', 'field-removed', 'field-type-changed',
+    'field-obsoleted', 'enum-value-removed', 'enum-ordinal-changed',
+    'enum-not-extensible', 'integration-point-changed', 'method-removed-used',
+    'access-restricted',
+}
+RETEST_CODES = {
+    'calcformula-changed', 'tablerelation-changed', 'permissions-changed',
+    'dataclassification-changed', 'posting-behaviour-changed', 'caption-changed',
+    'screen-behaviour-changed', 'data-scope-changed',
+}
+OPPORTUNITY_CODES = {'object-added', 'enum-value-added'}
+
+# Property -> consequenceCode, for property-level findings that matter
+# functionally. Anything not listed here is technical noise for this report.
+PROPERTY_CONSEQUENCE = {
+    'CalcFormula': 'calcformula-changed',
+    'TableRelation': 'tablerelation-changed',
+    'Permissions': 'permissions-changed',
+    'InherentPermissions': 'permissions-changed',
+    'InherentEntitlements': 'permissions-changed',
+    'DataClassification': 'dataclassification-changed',
+    'ObsoleteState': 'object-obsoleted',
+    'Extensible': 'enum-not-extensible',
+    'Access': 'access-restricted',
+    'Caption': 'caption-changed',
+    'Editable': 'screen-behaviour-changed',
+    'InsertAllowed': 'screen-behaviour-changed',
+    'ModifyAllowed': 'screen-behaviour-changed',
+    'DeleteAllowed': 'screen-behaviour-changed',
+    'SourceTable': 'screen-behaviour-changed',
+    'PageType': 'screen-behaviour-changed',
+    'TableType': 'data-scope-changed',
+    'ReplicateData': 'data-scope-changed',
+    'DataPerCompany': 'data-scope-changed',
+}
+
+
+def area_of(namespace):
+    """Namespace -> business area, the way a consultant groups the product.
+
+    BC namespaces are domain-shaped from v22 on (Microsoft.Sales.Document,
+    Microsoft.Inventory.Ledger, ...), so the second segment is the business
+    area. System.* is platform plumbing and collapses into one bucket.
+    """
+    if not namespace:
+        return 'Unclassified'
+    segments = namespace.split('.')
+    if segments[0] == 'System':
+        return 'Platform'
+    if segments[0] == 'Microsoft' and len(segments) > 1:
+        return segments[1]
+    return segments[0]
+
+
+# How our AL source can name a Microsoft object.
+AL_REFERENCE_PATTERNS = [
+    (re.compile(r'\b(?:table|page|report|enum|permissionset|profile)extension\s+\d+\s+'
+                r'(?:"[^"]+"|\w+)\s+extends\s+"([^"]+)"', re.IGNORECASE), 'extends'),
+    (re.compile(r'\bRecord\s+"([^"]+)"', re.IGNORECASE), 'record'),
+    (re.compile(r'\b(?:Codeunit|Page|Report|Table|Enum|Query|XmlPort|Interface)::"([^"]+)"',
+                re.IGNORECASE), 'reference'),
+    (re.compile(r'SourceTable\s*=\s*"([^"]+)"', re.IGNORECASE), 'sourcetable'),
+]
+AL_EVENT_PATTERN = re.compile(
+    r'EventSubscriber\s*\(\s*ObjectType::\w+\s*,\s*\w+::"([^"]+)"\s*,\s*\'([^\']*)\'',
+    re.IGNORECASE)
+# A quoted identifier after a dot - field access such as SalesHeader."No.".
+# Deliberately loose: it is used only to decide whether a member finding is
+# worth showing, never to claim a definite reference.
+AL_MEMBER_PATTERN = re.compile(r'\w\s*\.\s*"([^"]+)"')
+
+
+def scan_al_source(folder):
+    """What Microsoft objects and members does our own AL code name?"""
+    objects = {}
+    events = {}
+    members = {}
+    files = 0
+
+    for root, _dirs, names in os.walk(folder):
+        if any(part in ('.alpackages', '.snapshots', '.output', '.alcache')
+               for part in root.split(os.sep)):
+            continue
+        for name in sorted(names):
+            if not name.lower().endswith('.al'):
+                continue
+            path = os.path.join(root, name)
+            files += 1
+            try:
+                with open(path, encoding='utf-8-sig', errors='replace') as handle:
+                    lines = handle.readlines()
+            except OSError:
+                continue
+
+            relative = os.path.relpath(path, folder).replace(os.sep, '/')
+            for number, line in enumerate(lines, 1):
+                for pattern, how in AL_REFERENCE_PATTERNS:
+                    for match in pattern.findall(line):
+                        objects.setdefault(match, []).append(
+                            {'file': relative, 'line': number, 'how': how})
+                for object_name, event_name in AL_EVENT_PATTERN.findall(line):
+                    events.setdefault((object_name, event_name), []).append(
+                        {'file': relative, 'line': number, 'how': 'subscriber'})
+                    objects.setdefault(object_name, []).append(
+                        {'file': relative, 'line': number, 'how': 'subscriber'})
+                for member_name in AL_MEMBER_PATTERN.findall(line):
+                    members.setdefault(member_name, []).append(
+                        {'file': relative, 'line': number, 'how': 'member'})
+
+    return {'objects': objects, 'events': events, 'members': members, 'alFiles': files}
+
+
+def user_label(entry):
+    """The Caption when there is one, because that is what the user reads."""
+    return entry.get('caption') or entry.get('name') or ''
+
+
+def make_finding(severity, code, area, obj, facts, references):
+    return {
+        'severity': severity,
+        'consequenceCode': code,
+        'area': area,
+        'objectKind': obj['kind'],
+        'objectSurface': USER_FACING_KINDS.get(obj['kind'], 'technical'),
+        'objectId': obj.get('id'),
+        'objectName': obj.get('name'),
+        'objectLabel': user_label(obj),
+        'namespace': obj.get('namespace'),
+        'usedByCustomization': bool(references),
+        'references': references[:6],
+        'facts': facts,
+    }
+
+
+def build_rollup(report, al_index, declared_areas):
+    """Turn a symbol-changes report into a tiered, functional view."""
+    referenced_objects = al_index['objects']
+    referenced_events = al_index['events']
+    referenced_members = al_index['members']
+
+    # --- Tier 1 and the areas it implies --------------------------------
+    auto_areas = set()
+    footprint_by_area = Counter()
+    for app in report['apps']:
+        delta = app['delta']
+        groups = (delta['removedObjects'] + delta['addedObjects'] + delta['changedObjects']
+                  + delta['renamedObjects'] + delta['movedObjects'])
+        for obj in groups:
+            # Every collection carries 'name' and 'namespace'; a rename also
+            # carries the old name, and our AL source may still use either.
+            names = [obj.get('name'), obj.get('oldName')]
+            if any(name and name in referenced_objects for name in names):
+                area = area_of(obj.get('namespace'))
+                auto_areas.add(area)
+                footprint_by_area[area] += 1
+
+    effective_areas = set(auto_areas) | set(declared_areas)
+
+    # --- Walk every finding ----------------------------------------------
+    findings = []
+    out_of_scope = Counter()
+    suppressed = Counter()
+
+    def references_for(name, member=None):
+        found = list(referenced_objects.get(name, []))
+        if member:
+            found += referenced_events.get((name, member), [])
+            found += referenced_members.get(member, [])
+        return found
+
+    for app in report['apps']:
+        delta = app['delta']
+
+        # Renames and namespace moves keep the object Id: nothing a user or the
+        # data can notice. Counted so the report can say they were considered.
+        suppressed['renamed'] += len(delta['renamedObjects'])
+        suppressed['moved'] += len(delta['movedObjects'])
+
+        for obj in delta['removedObjects']:
+            area = area_of(obj['namespace'])
+            references = references_for(obj['name'])
+            in_scope = bool(references) or (
+                area in effective_areas and obj['kind'] in USER_FACING_KINDS)
+            if not in_scope:
+                out_of_scope[area] += 1
+                continue
+            findings.append(make_finding(
+                'blocker', 'object-removed', area, obj,
+                {'removedFrom': app['app'], 'oldVersion': app['oldVersion']}, references))
+
+        for obj in delta['addedObjects']:
+            area = area_of(obj['namespace'])
+            references = references_for(obj['name'])
+            # An addition is only interesting where we work, and only when it is
+            # something a user meets.
+            if area not in effective_areas or obj['kind'] not in USER_FACING_KINDS:
+                out_of_scope[area] += 1
+                continue
+            findings.append(make_finding(
+                'opportunity', 'object-added', area, obj,
+                {'addedIn': app['app'], 'newVersion': app['newVersion']}, references))
+
+        for obj in delta['changedObjects']:
+            area = area_of(obj['namespace'])
+            references = references_for(obj['name'])
+            area_in_scope = area in effective_areas
+            if not references and not area_in_scope:
+                out_of_scope[area] += 1
+                continue
+
+            for change in obj['propertyChanges']:
+                code = PROPERTY_CONSEQUENCE.get(change['property'])
+                if not code:
+                    suppressed['technical-property'] += 1
+                    continue
+                if code == 'object-obsoleted' and change['new'] != 'Removed':
+                    code = 'field-obsoleted'
+                severity = 'blocker' if code in BLOCKER_CODES else 'retest'
+                findings.append(make_finding(
+                    severity, code, area, obj,
+                    {'property': change['property'], 'old': change['old'],
+                     'new': change['new'], 'scope': 'object'}, references))
+
+            for member in obj['removedMembers']:
+                member_references = references_for(obj['name'], member['name'])
+                is_method = obj['kind'] in ('Codeunits', 'Interfaces', 'Pages',
+                                            'PageExtensions', 'Reports', 'ReportExtensions')
+                if is_method:
+                    # Base Application alone changes tens of thousands of
+                    # methods per release. Only the ones our code names can
+                    # matter functionally.
+                    if not member_references:
+                        suppressed['method-not-used'] += 1
+                        continue
+                    code = 'method-removed-used'
+                else:
+                    code = ('enum-value-removed'
+                            if obj['kind'].startswith('Enum') else 'field-removed')
+                    if not member_references and not area_in_scope:
+                        out_of_scope[area] += 1
+                        continue
+                findings.append(make_finding(
+                    'blocker', code, area, obj,
+                    {'member': member['name'], 'memberLabel': user_label(member),
+                     'was': member['signature'], 'scope': 'member'}, member_references))
+
+            for member in obj['changedMembers']:
+                member_references = references_for(obj['name'], member['name'])
+                category = member.get('category', 'info')
+                reasons = member.get('reasons', [])
+                is_method = obj['kind'] in ('Codeunits', 'Interfaces', 'Pages',
+                                            'PageExtensions', 'Reports', 'ReportExtensions')
+
+                if is_method:
+                    if not member_references or category not in ('breaking', 'obsolete'):
+                        suppressed['method-not-used'] += 1
+                        continue
+                    code = 'integration-point-changed'
+                    severity = 'blocker' if category == 'breaking' else 'retest'
+                elif obj['kind'].startswith('Enum'):
+                    if category != 'breaking':
+                        suppressed['technical-member'] += 1
+                        continue
+                    code = 'enum-ordinal-changed'
+                    severity = 'blocker'
+                else:
+                    codes = set()
+                    for reason in reasons:
+                        head = reason.split(' ')[0]
+                        mapped = PROPERTY_CONSEQUENCE.get(head)
+                        if mapped:
+                            codes.add(mapped)
+                    if reason_has_type_change(reasons):
+                        codes.add('field-type-changed')
+                    if not codes:
+                        suppressed['technical-member'] += 1
+                        continue
+                    code = sorted(codes, key=lambda c: (c not in BLOCKER_CODES, c))[0]
+                    severity = 'blocker' if code in BLOCKER_CODES else 'retest'
+                    if not member_references and not area_in_scope:
+                        out_of_scope[area] += 1
+                        continue
+
+                findings.append(make_finding(
+                    severity, code, area, obj,
+                    {'member': member['name'], 'memberLabel': user_label(member),
+                     'old': member['old'], 'new': member['new'],
+                     'reasons': reasons, 'scope': 'member'}, member_references))
+
+    return {
+        'areas': {
+            'derivedFromCode': sorted(auto_areas),
+            'declared': sorted(declared_areas),
+            'effective': sorted(effective_areas),
+        },
+        'customizationFootprint': {
+            'alFiles': al_index['alFiles'],
+            'microsoftObjectsReferenced': len(referenced_objects),
+            'changedObjectsWeReference': sum(footprint_by_area.values()),
+            'byArea': dict(footprint_by_area.most_common()),
+        },
+        'findings': findings,
+        'outOfScopeByArea': dict(out_of_scope.most_common()),
+        'suppressedAsTechnical': dict(suppressed),
+    }
+
+
+def reason_has_type_change(reasons):
+    return any(reason.startswith('type ') for reason in reasons)
+
+
+BLOCKER_CAP = 0      # no cap - these must all be shown
+RETEST_CAP = 300
+OPPORTUNITY_CAP = 100
+
+
+def render_rollup_markdown(rollup, header):
+    """A deterministic fallback view. The narrative report is written from the
+    JSON by the analysis step; this one is always available even when that
+    step is skipped or fails."""
+    lines = []
+    lines.append('# Functional impact - mechanical rollup')
+    lines.append('')
+    lines.append('| | |')
+    lines.append('| --- | --- |')
+    for label, value in header.items():
+        lines.append('| %s | %s |' % (label, value))
+    lines.append('')
+    lines.append('Generated by diff_symbols.py rollup. No wording or judgement is applied '
+                 'here - each row states the finding and the facts behind it.')
+    lines.append('')
+
+    areas = rollup['areas']
+    lines.append('## Scope')
+    lines.append('')
+    lines.append('- Areas derived from the AL source: %s'
+                 % (', '.join(areas['derivedFromCode']) or 'none'))
+    lines.append('- Areas declared in settings: %s'
+                 % (', '.join(areas['declared']) or 'none'))
+    lines.append('- Effective scope: %s' % (', '.join(areas['effective']) or 'none'))
+    footprint = rollup['customizationFootprint']
+    lines.append('- Customization: %d AL file(s) naming %d Microsoft object(s)'
+                 % (footprint['alFiles'], footprint['microsoftObjectsReferenced']))
+    lines.append('')
+
+    order = [('blocker', 'Must be handled before the upgrade', BLOCKER_CAP),
+             ('retest', 'Needs re-testing', RETEST_CAP),
+             ('opportunity', 'New standard capability', OPPORTUNITY_CAP)]
+    for severity, title, cap in order:
+        rows = [f for f in rollup['findings'] if f['severity'] == severity]
+        rows.sort(key=lambda f: (not f['usedByCustomization'], f['area'], f['objectLabel']))
+        lines.append('## %s (%d)' % (title, len(rows)))
+        lines.append('')
+        if not rows:
+            lines.append('None.')
+            lines.append('')
+            continue
+        shown = rows if cap == 0 else rows[:cap]
+        lines.append('| Area | What | Finding | Used by our app |')
+        lines.append('| --- | --- | --- | --- |')
+        for finding in shown:
+            what = finding['objectLabel']
+            if finding['facts'].get('memberLabel') or finding['facts'].get('member'):
+                what = '%s / %s' % (what, finding['facts'].get('memberLabel')
+                                    or finding['facts']['member'])
+            used = 'yes' if finding['usedByCustomization'] else '-'
+            if finding['references']:
+                used = '%s (%s:%s)' % (used, finding['references'][0]['file'],
+                                       finding['references'][0]['line'])
+            lines.append('| %s | %s | %s | %s |' % (
+                finding['area'], what, finding['consequenceCode'], used))
+        if len(rows) > len(shown):
+            lines.append('')
+            lines.append('%d more - see business-impact.json.' % (len(rows) - len(shown)))
+        lines.append('')
+
+    lines.append('## Out of scope - counted, not listed')
+    lines.append('')
+    out_of_scope = rollup['outOfScopeByArea']
+    if out_of_scope:
+        lines.append(' · '.join('%s %d' % (area, count) for area, count in out_of_scope.items()))
+    else:
+        lines.append('None.')
+    lines.append('')
+    lines.append('## Dropped as technical, with no functional meaning')
+    lines.append('')
+    suppressed = rollup['suppressedAsTechnical']
+    lines.append(' · '.join('%s %d' % (reason, count)
+                            for reason, count in suppressed.items()) or 'None.')
     return '\n'.join(lines)
 
 
@@ -852,7 +1310,207 @@ def command_diff(args):
     return 0
 
 
+def command_rollup(args):
+    with open(args.changes, encoding='utf-8') as handle:
+        report = json.load(handle)
+
+    al_index = scan_al_source(args.al_source)
+    if al_index['alFiles'] == 0:
+        print('::warning::No .al files under %s - nothing can be scoped to the customization, '
+              'so every finding will fall back to the declared business areas.' % args.al_source)
+
+    declared = [area.strip() for area in (args.business_areas or '').split(',') if area.strip()]
+
+    # A mistyped area name narrows the scope in silence, which is the class of
+    # bug this whole workflow exists to remove. Check the declared names against
+    # the areas the diff actually contains.
+    present = set()
+    for app in report['apps']:
+        delta = app['delta']
+        for group in ('removedObjects', 'addedObjects', 'changedObjects',
+                      'renamedObjects', 'movedObjects'):
+            for obj in delta[group]:
+                present.add(area_of(obj.get('namespace')))
+    unknown = [area for area in declared if area not in present]
+    if unknown:
+        print('::warning::businessAreas contains %d name(s) that do not match any business area '
+              'in this diff: %s. Known areas: %s. A mistyped name silently narrows the report.'
+              % (len(unknown), ', '.join(unknown), ', '.join(sorted(present))))
+
+    rollup = build_rollup(report, al_index, declared)
+    rollup['environment'] = report.get('environment', '')
+    rollup['currentVersion'] = report.get('currentVersion', '')
+    rollup['targetVersion'] = report.get('targetVersion', '')
+    rollup['unknownDeclaredAreas'] = unknown
+
+    coverage_gaps = []
+    if args.resolution and os.path.isfile(args.resolution):
+        with open(args.resolution, encoding='utf-8') as handle:
+            resolution = json.load(handle)
+        coverage_gaps = resolution.get('skipped') or []
+    rollup['coverageGaps'] = coverage_gaps
+
+    counts = Counter(finding['severity'] for finding in rollup['findings'])
+    counts['findings'] = len(rollup['findings'])
+    counts['areasInScope'] = len(rollup['areas']['effective'])
+    counts['coverageGaps'] = len(coverage_gaps)
+    rollup['counts'] = dict(counts)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    json_path = os.path.join(args.out_dir, 'business-impact.json')
+    markdown_path = os.path.join(args.out_dir, 'business-impact.md')
+
+    with open(json_path, 'w', encoding='utf-8') as handle:
+        json.dump(rollup, handle, indent=1, ensure_ascii=False)
+    with open(markdown_path, 'w', encoding='utf-8') as handle:
+        handle.write(render_rollup_markdown(rollup, OrderedDict([
+            ('Environment', rollup['environment']),
+            ('Version on environment', rollup['currentVersion']),
+            ('Target version', rollup['targetVersion']),
+            ('Packages compared', len(report['apps'])),
+            ('Coverage gaps', len(coverage_gaps)),
+        ])))
+
+    print('AL files scanned          : %d' % al_index['alFiles'])
+    print('Microsoft objects named   : %d' % len(al_index['objects']))
+    print('Areas from code           : %s'
+          % (', '.join(rollup['areas']['derivedFromCode']) or 'none'))
+    print('Areas declared            : %s' % (', '.join(declared) or 'none'))
+    print('Effective scope           : %s' % ', '.join(rollup['areas']['effective']))
+    print('')
+    print('Must handle before upgrade: %d' % counts.get('blocker', 0))
+    print('Needs re-testing          : %d' % counts.get('retest', 0))
+    print('New capabilities          : %d' % counts.get('opportunity', 0))
+    print('Out of scope (counted)    : %d'
+          % sum(rollup['outOfScopeByArea'].values()))
+    print('Dropped as technical      : %d' % sum(rollup['suppressedAsTechnical'].values()))
+    print('')
+    print('Wrote %s' % json_path)
+    print('Wrote %s' % markdown_path)
+
+    github_output = os.environ.get('GITHUB_OUTPUT')
+    if github_output:
+        with open(github_output, 'a', encoding='utf-8') as handle:
+            for name in ('blocker', 'retest', 'opportunity', 'findings',
+                         'areasInScope', 'coverageGaps'):
+                handle.write('%s=%s\n' % (name, counts.get(name, 0)))
+    return 0
+
+
+def parse_fenced_list(text, language):
+    """Read a ```<language> fenced block as a list of lines.
+
+    Used to pull the banned-vocabulary and required-sections lists out of the
+    report's instruction file, so the contract a consultant edits is the one the
+    workflow actually enforces - rather than a second copy that drifts.
+    """
+    pattern = re.compile(r'```%s\s*\n(.*?)\n```' % re.escape(language), re.DOTALL)
+    match = pattern.search(text)
+    if not match:
+        return []
+    return [line.strip() for line in match.group(1).splitlines() if line.strip()]
+
+
+def command_checkreport(args):
+    """Check a written report against its own instruction file.
+
+    This exists because the two reports are produced in one pass: the single
+    lever that keeps the functional report from drifting into developer language
+    is a check on the finished text. It reports, it does not fail the run - a
+    report with leaked jargon is still worth having.
+    """
+    if not os.path.isfile(args.report):
+        print('::warning::%s was not written - nothing to check.' % args.report)
+        return 0
+    if not os.path.isfile(args.instruction):
+        print('::warning::%s not found - cannot check the report against its contract.'
+              % args.instruction)
+        return 0
+
+    with open(args.report, encoding='utf-8', errors='replace') as handle:
+        report = handle.read()
+    with open(args.instruction, encoding='utf-8', errors='replace') as handle:
+        instruction = handle.read()
+
+    banned = parse_fenced_list(instruction, 'banned-vocabulary')
+    required = parse_fenced_list(instruction, 'required-sections')
+    if not banned and not required:
+        print('::warning::%s has no banned-vocabulary or required-sections block - '
+              'the report cannot be checked.' % args.instruction)
+        return 0
+
+    lowered = report.lower()
+    lines = report.splitlines()
+
+    leaks = []
+    for term in banned:
+        needle = term.lower()
+        count = lowered.count(needle)
+        if not count:
+            continue
+        first = next((number for number, line in enumerate(lines, 1)
+                      if needle in line.lower()), 0)
+        leaks.append((term, count, first))
+
+    missing = [heading for heading in required if heading.lower() not in lowered]
+
+    name = os.path.basename(args.report)
+    print('Checking %s against %s' % (name, os.path.basename(args.instruction)))
+    print('  words checked    : %d' % len(banned))
+    print('  sections checked : %d' % len(required))
+    print('  size             : %d line(s), %d characters' % (len(lines), len(report)))
+
+    if leaks:
+        detail = ', '.join('%s (%dx, first at line %d)' % entry for entry in leaks)
+        print('::warning::%s uses %d term(s) its contract bans: %s. The report is still in '
+              'the artifact, but it reads as a developer document in those places.'
+              % (name, len(leaks), detail))
+    else:
+        print('  no banned vocabulary found')
+
+    if missing:
+        print('::warning::%s is missing %d required section(s): %s.'
+              % (name, len(missing), ', '.join(missing)))
+    else:
+        print('  all required sections present')
+
+    if args.compare_with and os.path.isfile(args.compare_with):
+        with open(args.compare_with, encoding='utf-8', errors='replace') as handle:
+            other = handle.read()
+        # Two reports for two audiences should not be the same document. An
+        # identical or near-identical pair is the failure mode of producing both
+        # in one pass.
+        shared = set(l.strip() for l in lines if len(l.strip()) > 40)
+        other_lines = set(l.strip() for l in other.splitlines() if len(l.strip()) > 40)
+        overlap = len(shared & other_lines)
+        ratio = (overlap / len(shared)) if shared else 0
+        print('  overlap with %s : %d of %d substantial line(s) (%.0f%%)'
+              % (os.path.basename(args.compare_with), overlap, len(shared), 100 * ratio))
+        if ratio > 0.3:
+            print('::warning::%s shares %.0f%% of its substantial lines with %s. The two '
+                  'reports are meant for different readers - this one looks like a copy.'
+                  % (name, 100 * ratio, os.path.basename(args.compare_with)))
+
+    github_output = os.environ.get('GITHUB_OUTPUT')
+    if github_output:
+        with open(github_output, 'a', encoding='utf-8') as handle:
+            handle.write('bannedTerms=%d\n' % len(leaks))
+            handle.write('missingSections=%d\n' % len(missing))
+    return 0
+
+
 def main():
+    # Object captions, business area names and the section headings in the
+    # report contract can all be non-ASCII. On Windows, Python writes stdout in
+    # the locale codepage (cp1252 here) when it is redirected, and printing a
+    # Vietnamese section name then raises UnicodeEncodeError - which fails the
+    # workflow step for no good reason. Ask for UTF-8 explicitly.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
 
@@ -868,6 +1526,25 @@ def main():
     diff.add_argument('--current-version', default='')
     diff.add_argument('--target-version', default='')
     diff.set_defaults(handler=command_diff)
+
+    rollup = commands.add_parser(
+        'rollup', help='turn a symbol diff into a tiered functional view')
+    rollup.add_argument('--changes', required=True, help='symbol-changes.json from "diff"')
+    rollup.add_argument('--al-source', required=True, help='folder holding our own .al files')
+    rollup.add_argument('--business-areas', default='',
+                        help='comma-separated areas the customer uses (e.g. Sales,Finance)')
+    rollup.add_argument('--resolution', default='',
+                        help='resolution.json, for the coverage-gap list')
+    rollup.add_argument('--out-dir', required=True)
+    rollup.set_defaults(handler=command_rollup)
+
+    checkreport = commands.add_parser(
+        'checkreport', help='check a written report against its instruction file')
+    checkreport.add_argument('--report', required=True)
+    checkreport.add_argument('--instruction', required=True)
+    checkreport.add_argument('--compare-with', default='',
+                             help='the other audience\'s report, to detect a near-copy')
+    checkreport.set_defaults(handler=command_checkreport)
 
     args = parser.parse_args()
     return args.handler(args)
