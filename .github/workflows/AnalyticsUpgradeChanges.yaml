@@ -75,12 +75,17 @@ jobs:
       # ------------------------------------------------------------------
       # GATE 1 - the extractor must be able to find objects at all.
       #
-      # The repository keeps a set of real v28 symbol packages under
-      # ALGo-App/.alpackages. Running the extractor against them before doing
-      # any network work is what catches a parser that stopped finding objects
+      # Runs before any network work, so a parser that stopped finding objects
       # (for instance because Microsoft moved them under "Namespaces", which is
-      # exactly what broke the previous workflow). Cheap, offline, and it fails
-      # the run instead of producing an empty report an hour later.
+      # exactly what broke the previous workflow) fails the run in seconds
+      # instead of producing an empty report an hour later.
+      #
+      # The unit tests build a .app package in memory - NAVX-style header, zip,
+      # BOM, objects nested in namespaces - so this gate needs no symbol
+      # packages and no network. ALGo-App/.alpackages is gitignored (.alpackages/
+      # and *.app), so the runner does not have it; the self-test below reports a
+      # skip there and only does real work on a developer machine. A live run is
+      # gated again by GATE 4, which fails when the diff extracts nothing.
       # ------------------------------------------------------------------
       - name: Verify symbol extractor
         shell: pwsh
@@ -92,7 +97,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "diff_symbols unit tests failed - refusing to run the analysis." }
 
           Write-Host ""
-          Write-Host "--- self-test against the symbol packages committed in the repo ---"
+          Write-Host "--- self-test against real symbol packages, when present locally ---"
           python .github/scripts/diff_symbols.py selftest --symbols-dir ALGo-App/.alpackages
           if ($LASTEXITCODE -ne 0) { throw "The symbol extractor self-test failed - refusing to run the analysis." }
 

@@ -7,7 +7,12 @@ These cover the cases the previous in-workflow implementation got wrong, so a
 regression shows up here instead of as a silently empty upgrade report.
 """
 
-import copy
+import io
+import json
+import os
+import tempfile
+import zipfile
+
 import sys
 
 import diff_symbols as ds
@@ -141,6 +146,75 @@ check('attributes are part of the signature',
       'IntegrationEvent' in flat['Codeunits/80']['members']['OnBeforePostSalesDoc']['signature'])
 check('enum ordinal defaults to 0 when absent',
       flat['EnumTypes/100']['members']['Quote']['ordinal'] == 0)
+
+print('\nReading a .app package (NAVX header + zip + BOM)')
+
+# The real symbol packages live under ALGo-App/.alpackages, which is gitignored -
+# a CI runner never sees them. So the binary read path is covered by building a
+# package here instead: a NAVX-style header followed by a zip, exactly the shape
+# read_symbol_reference has to cope with.
+
+
+def build_app_package(tree, header_size=40, with_bom=True):
+    payload = json.dumps(tree).encode('utf-8')
+    if with_bom:
+        payload = b'\xef\xbb\xbf' + payload
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('SymbolReference.json', payload)
+        archive.writestr('NavxManifest.xml', '<Package />')
+
+    return bytes(bytearray(range(header_size % 256))[:header_size]) + buffer.getvalue()
+
+
+def write_temp(data, suffix='.app'):
+    handle, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(handle, 'wb') as stream:
+        stream.write(data)
+    return path
+
+
+package_path = write_temp(build_app_package(base_tree()))
+try:
+    parsed = ds.read_symbol_reference(package_path)
+    check('header is skipped and the zip is opened', parsed.get('Name') == 'Test App')
+    check('BOM does not break the JSON parse', parsed.get('Publisher') == 'Microsoft')
+    check('objects survive the round trip', len(ds.flatten(parsed)) == 3)
+finally:
+    os.unlink(package_path)
+
+# A 3-byte header is as valid as a 40-byte one - the reader must search, not assume.
+package_path = write_temp(build_app_package(base_tree(), header_size=3, with_bom=False))
+try:
+    parsed = ds.read_symbol_reference(package_path)
+    check('header size is not hard-coded, BOM is optional', len(ds.flatten(parsed)) == 3)
+finally:
+    os.unlink(package_path)
+
+package_path = write_temp(b'NAVX' + b'\x00' * 200)
+try:
+    try:
+        ds.read_symbol_reference(package_path)
+        check('a package with no zip is rejected', False, '(no exception raised)')
+    except ValueError as error:
+        check('a package with no zip is rejected', 'no zip archive' in str(error))
+finally:
+    os.unlink(package_path)
+
+buffer = io.BytesIO()
+with zipfile.ZipFile(buffer, 'w') as archive:
+    archive.writestr('NavxManifest.xml', '<Package />')
+package_path = write_temp(b'\x00' * 40 + buffer.getvalue())
+try:
+    try:
+        ds.read_symbol_reference(package_path)
+        check('a package without SymbolReference.json is rejected', False, '(no exception raised)')
+    except ValueError as error:
+        check('a package without SymbolReference.json is rejected',
+              'SymbolReference.json not found' in str(error))
+finally:
+    os.unlink(package_path)
 
 print('\nObject identity')
 
