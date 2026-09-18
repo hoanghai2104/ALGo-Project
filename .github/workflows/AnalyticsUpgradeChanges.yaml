@@ -236,20 +236,60 @@ jobs:
           }
 
           # ------------------------------------------------------------------
-          # GATE 2 - localization must be known.
+          # GATE 2 - localization must be known, and must be stated somewhere.
           #
           # Symbol packages are published per localization (Microsoft.X.CH.symbols
-          # vs Microsoft.X.symbols for W1). Quietly defaulting to w1 means
-          # comparing a different product against the environment and reporting
-          # the result as if it were the environment's own. Either we know the
-          # country, or the caller states it, or we stop.
+          # vs Microsoft.X.symbols for W1). Comparing the wrong localization
+          # against the environment produces a diff that looks plausible and is
+          # wrong, so guessing is not an option.
+          #
+          # Three sources, in order, each of them explicit. What is NOT allowed
+          # is falling back to 'w1' because nothing said otherwise - that is the
+          # silent default this gate exists to prevent.
+          #   1. the environment itself, via the Admin Center API (ground truth)
+          #   2. the 'country' workflow input (deliberate per-run override)
+          #   3. the 'country' AL-Go setting (declared once, versioned, reviewed)
           # ------------------------------------------------------------------
-          if (!$countryCode -and $env:countryOverride) {
-            $countryCode = $env:countryOverride
-            Write-Host "Localization        : $countryCode (from the 'country' workflow input)"
+          $settingsCountry = ''
+          if ($settings.PSObject.Properties.Name -contains 'country' -and $settings.country) {
+            $settingsCountry = $settings.country
           }
+
+          $countrySource = 'the environment (Admin Center API)'
+          if ($countryCode) {
+            # The environment's own value wins, but a contradicting override is
+            # worth saying out loud rather than discarding in silence.
+            foreach($candidate in @(
+                @{ value = $env:countryOverride; label = "the 'country' workflow input" },
+                @{ value = $settingsCountry;     label = "the 'country' AL-Go setting" })) {
+              if ($candidate.value -and $candidate.value.ToLowerInvariant() -ne $countryCode.ToLowerInvariant()) {
+                Write-Host "::warning::$($candidate.label) says '$($candidate.value)' but $environmentName reports '$countryCode'. Using the environment's own value."
+              }
+            }
+          }
+          elseif ($env:countryOverride) {
+            $countryCode = $env:countryOverride
+            $countrySource = "the 'country' workflow input"
+          }
+          elseif ($settingsCountry) {
+            $countryCode = $settingsCountry
+            $countrySource = "the 'country' AL-Go setting"
+          }
+
           if (!$countryCode) {
-            throw "Could not determine the localization of '$environmentName' ($source could not supply countryCode). Re-run with the 'country' input set (e.g. ch, w1), or grant the Entra app 'AdminCenter.ReadWrite.All' so the Admin Center API can be used."
+            throw @"
+          Could not determine the localization of '$environmentName' - $source cannot supply countryCode, and no localization is declared anywhere.
+
+          Pick one:
+            * Re-run this workflow with the 'country' input set (e.g. ch, w1) - quickest.
+            * Add "country": "<cc>" to .github/AL-Go-Settings.json - declared once, applies to every run.
+            * Grant the Entra app the 'AdminCenter.ReadWrite.All' application permission (with admin
+              consent) and list it under 'Authorized Microsoft Entra apps' in the BC admin center.
+              This is the only option that also reports the platform version.
+
+          The environment's localization is shown per environment in the BC admin center
+          (admin.businesscentral.dynamics.com -> Environments -> Country/Region).
+          "@
           }
           $countryCode = $countryCode.ToLowerInvariant()
 
@@ -260,7 +300,7 @@ jobs:
           Write-Host "Source              : $source"
           Write-Host "Type                : $environmentType"
           Write-Host "Status              : $status"
-          Write-Host "Localization        : $countryCode"
+          Write-Host "Localization        : $countryCode (from $countrySource)"
           Write-Host "Application version : $applicationVersion"
           Write-Host "Platform version    : $platformVersion"
 
@@ -430,6 +470,7 @@ jobs:
           tenantId: ${{ steps.resolveEnvironment.outputs.tenantId }}
           environmentName: ${{ steps.resolveEnvironment.outputs.environmentName }}
           platformVersion: ${{ steps.resolveEnvironment.outputs.platformVersion }}
+          applicationVersion: ${{ steps.resolveEnvironment.outputs.applicationVersion }}
           country: ${{ steps.resolveEnvironment.outputs.countryCode }}
           targetVersion: ${{ steps.resolveTarget.outputs.targetVersion }}
           targetMajorMinor: ${{ steps.resolveTarget.outputs.targetMajorMinor }}
@@ -485,7 +526,17 @@ jobs:
               # The platform app ("System") is not an extension, so it never appears in the list
               if ($item.name -eq 'System') {
                 $systemVersion = $env:platformVersion
-                if (!$systemVersion) { $systemVersion = $item.declaredVersion }
+                if (!$systemVersion) {
+                  # app.json's "platform" is a MINIMUM (typically 1.0.0.0), not the
+                  # version the environment runs - resolving the feed against it
+                  # finds nothing and drops the platform symbols altogether.
+                  # Platform and application share major.minor on BC online
+                  # (e.g. platform 28.0.51101.0 alongside application
+                  # 28.0.46665.51148), so the application version is the sound
+                  # stand-in when the Admin Center API is unavailable.
+                  $systemVersion = $env:applicationVersion
+                  Write-Host "::warning::The platform version of $environmentName is unknown (the Admin Center API was not available). Resolving the System symbols against the application version's release ($systemVersion) instead of app.json's platform minimum ($($item.declaredVersion))."
+                }
                 $toDownload += [PSCustomObject]@{ name = 'System'; version = $systemVersion; declaredVersion = $item.declaredVersion; appId = $item.appId }
               }
               else {

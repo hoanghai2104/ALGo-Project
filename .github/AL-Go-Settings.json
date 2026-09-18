@@ -12,7 +12,7 @@
   ],
   "DeployToTEST": {
     "EnvironmentName": "Sandbox_ThangNT",
-    "continuousDeployment": true,
+    "continuousDeployment": false,
     "Branches": [
       "main"
     ]
