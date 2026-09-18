@@ -1,0 +1,895 @@
+name: 'Analytics Upgrade Changes'
+
+# Compares the Microsoft symbols currently running on a Business Central
+# environment against a target version, and reports what an upgrade would break
+# in our own AL app.
+#
+# Derived from CustomWorkflow.yaml. Every step below that carries a "GATE" or
+# "WHY" comment exists because the earlier version failed silently there: it
+# reported "no breaking changes" from an inventory that was empty by
+# construction. The rule this workflow follows is that missing data is an error,
+# never an implicit "all clear".
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'GitHub environment to analyse (Settings -> Environments)'
+        type: choice
+        options:
+          - TEST
+          - PROD
+        default: TEST
+      targetVersion:
+        description: 'Target BC version, e.g. 28.0 or 28.0.12345.67890. Empty = latest released.'
+        required: false
+        default: ''
+      country:
+        description: 'Localization override (e.g. ch, w1). Only needed when the Admin Center API is unreachable.'
+        required: false
+        default: ''
+      includeSymbols:
+        description: 'Ship the downloaded .app symbol packages in the artifact (large)'
+        type: boolean
+        default: false
+      skipCopilot:
+        description: 'Produce the structured diff only, skip the Copilot analysis'
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: analytics-upgrade-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: true
+
+env:
+  ALGoOrgSettings: ${{ vars.ALGoOrgSettings }}
+  ALGoRepoSettings: ${{ vars.ALGoRepoSettings }}
+
+jobs:
+  analyze-upgrade:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    env:
+      ALGoEnvSettings: ${{ vars.ALGoEnvironmentSettings }}
+      ALGoEnvName: ${{ inputs.environment }}
+      # Folders used throughout the job.
+      outputRoot: 'upgrade-analysis'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ------------------------------------------------------------------
+      # GATE 1 - the extractor must be able to find objects at all.
+      #
+      # The repository keeps a set of real v28 symbol packages under
+      # ALGo-App/.alpackages. Running the extractor against them before doing
+      # any network work is what catches a parser that stopped finding objects
+      # (for instance because Microsoft moved them under "Namespaces", which is
+      # exactly what broke the previous workflow). Cheap, offline, and it fails
+      # the run instead of producing an empty report an hour later.
+      # ------------------------------------------------------------------
+      - name: Verify symbol extractor
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+
+          Write-Host "--- unit tests ---"
+          python .github/scripts/test_diff_symbols.py
+          if ($LASTEXITCODE -ne 0) { throw "diff_symbols unit tests failed - refusing to run the analysis." }
+
+          Write-Host ""
+          Write-Host "--- self-test against the symbol packages committed in the repo ---"
+          python .github/scripts/diff_symbols.py selftest --symbols-dir ALGo-App/.alpackages
+          if ($LASTEXITCODE -ne 0) { throw "The symbol extractor self-test failed - refusing to run the analysis." }
+
+      - name: Read settings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: pwsh
+
+      - name: Read secrets
+        id: ReadSecrets
+        uses: microsoft/AL-Go-Actions/ReadSecrets@v9.2
+        with:
+          shell: pwsh
+          gitHubSecrets: ${{ toJson(secrets) }}
+          getSecrets: '${{ inputs.environment }}-AuthContext,AuthContext'
+
+      # ------------------------------------------------------------------
+      # Resolve the environment: which BC environment, which version, which
+      # localization, and an access token.
+      #
+      # WHY the token is a step output and not GITHUB_ENV: anything written to
+      # GITHUB_ENV is injected into the environment of every later step,
+      # including the one that runs the Copilot CLI with --allow-all-tools. As
+      # an output it reaches only the steps that name it explicitly.
+      # ------------------------------------------------------------------
+      - name: Resolve environment
+        id: resolveEnvironment
+        shell: pwsh
+        env:
+          Secrets: ${{ steps.ReadSecrets.outputs.Secrets }}
+          githubEnvironment: ${{ inputs.environment }}
+          countryOverride: ${{ inputs.country }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $githubEnvironment = $env:githubEnvironment
+          $settings = $env:Settings | ConvertFrom-Json
+
+          # --- BC environment name from AL-Go settings: DeployTo<env>.EnvironmentName ---
+          # No hard-coded fallback. A wrong environment name silently analyses
+          # somebody else's sandbox, so an unresolvable name is a hard error.
+          $deployToKey = "DeployTo$githubEnvironment"
+          $environmentName = ''
+          if ($settings.PSObject.Properties.Name -contains $deployToKey -and $settings."$deployToKey".EnvironmentName) {
+            $environmentName = $settings."$deployToKey".EnvironmentName
+          }
+          if (!$environmentName) {
+            throw "No BC environment name for '$githubEnvironment'. Add $deployToKey.EnvironmentName to .github/AL-Go-Settings.json."
+          }
+          Write-Host "GitHub environment  : $githubEnvironment"
+          Write-Host "BC environment      : $environmentName"
+
+          # --- AuthContext ---
+          $secrets = $env:Secrets | ConvertFrom-Json
+          $authContextJson = $null
+          foreach($secretName in @("$githubEnvironment-AuthContext", 'AuthContext')) {
+            if (!$authContextJson -and $secrets.PSObject.Properties.Name -contains $secretName -and $secrets."$secretName") {
+              $value = $secrets."$secretName"
+              # ReadSecrets returns secret values base64 encoded - fall back to the raw value
+              try { $value = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($value)) } catch {}
+              $authContextJson = $value
+              Write-Host "AuthContext secret  : $secretName"
+            }
+          }
+          if (!$authContextJson) {
+            throw "No AuthContext secret found for environment '$githubEnvironment'. Check <env>-AuthContextSecretName in .github/AL-Go-Settings.json."
+          }
+
+          $authContext = $authContextJson | ConvertFrom-Json
+          function Get-Value([object] $obj, [string[]] $names) {
+            foreach($name in $names) {
+              if ($obj.PSObject.Properties.Name -contains $name -and $obj."$name") { return $obj."$name" }
+            }
+            return $null
+          }
+          $tenantId     = Get-Value $authContext @('TenantId','tenantID','tenant')
+          $clientId     = Get-Value $authContext @('ClientId','clientID')
+          $clientSecret = Get-Value $authContext @('ClientSecret')
+          $refreshToken = Get-Value $authContext @('RefreshToken')
+          if (!$tenantId -or !$clientId) { throw "AuthContext secret must contain TenantId and ClientId." }
+
+          $scope = 'https://api.businesscentral.dynamics.com/.default'
+          if ($clientSecret) {
+            Write-Host "Authentication      : client credentials"
+            $body = @{ grant_type = 'client_credentials'; client_id = $clientId; client_secret = $clientSecret; scope = $scope }
+          }
+          elseif ($refreshToken) {
+            Write-Host "Authentication      : refresh token"
+            $body = @{ grant_type = 'refresh_token'; client_id = $clientId; refresh_token = $refreshToken; scope = "$scope offline_access" }
+          }
+          else {
+            throw "AuthContext secret must contain either ClientSecret or RefreshToken."
+          }
+          $token = (Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $body -ContentType 'application/x-www-form-urlencoded').access_token
+          Write-Host "::add-mask::$token"
+
+          # --- Version and localization of the environment ---
+          $headers = @{ Authorization = "Bearer $token" }
+          $environmentType = ''; $countryCode = ''; $status = ''
+          $applicationVersion = ''; $platformVersion = ''; $source = ''
+
+          $adminApi = "https://api.businesscentral.dynamics.com/admin/v2.24/applications/BusinessCentral/environments"
+          try {
+            $bcEnvironments = @((Invoke-RestMethod -Method Get -Uri $adminApi -Headers $headers).value)
+            $bcEnvironment = $bcEnvironments | Where-Object { $_.name -eq $environmentName } | Select-Object -First 1
+            if (!$bcEnvironment) {
+              throw "Environment '$environmentName' not found in the tenant. Environments present: $(($bcEnvironments | ForEach-Object { $_.name }) -join ', ')"
+            }
+            $environmentType = $bcEnvironment.type
+            $countryCode = $bcEnvironment.countryCode
+            $status = $bcEnvironment.status
+            $applicationVersion = $bcEnvironment.applicationVersion
+            $platformVersion = $bcEnvironment.platformVersion
+            $source = 'Admin Center API'
+          }
+          catch {
+            $statusCode = ''
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            if ($statusCode -notin @(401, 403)) { throw }
+
+            Write-Host "::warning::Admin Center API returned $statusCode. The Entra app is missing 'AdminCenter.ReadWrite.All' or is not listed under 'Authorized Microsoft Entra apps'. Falling back to the Automation API - note that it reports neither the platform version nor the localization."
+
+            $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$tenantId/$environmentName/api/microsoft/automation/v2.0"
+            $companies = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value)
+            if ($companies.Count -eq 0) { throw "No companies returned from $automationApi/companies" }
+            $extensions = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies($($companies[0].id))/extensions" -Headers $headers).value)
+            foreach($displayName in @('Base Application','System Application')) {
+              $extension = $extensions | Where-Object { $_.displayName -eq $displayName } | Select-Object -First 1
+              if ($extension) {
+                $version = "$($extension.versionMajor).$($extension.versionMinor).$($extension.versionBuild).$($extension.versionRevision)"
+                if ($displayName -eq 'Base Application') { $applicationVersion = $version }
+              }
+            }
+            if (!$applicationVersion) { throw "Could not determine the application version of '$environmentName'." }
+            $source = 'Automation API'
+          }
+
+          # ------------------------------------------------------------------
+          # GATE 2 - localization must be known.
+          #
+          # Symbol packages are published per localization (Microsoft.X.CH.symbols
+          # vs Microsoft.X.symbols for W1). Quietly defaulting to w1 means
+          # comparing a different product against the environment and reporting
+          # the result as if it were the environment's own. Either we know the
+          # country, or the caller states it, or we stop.
+          # ------------------------------------------------------------------
+          if (!$countryCode -and $env:countryOverride) {
+            $countryCode = $env:countryOverride
+            Write-Host "Localization        : $countryCode (from the 'country' workflow input)"
+          }
+          if (!$countryCode) {
+            throw "Could not determine the localization of '$environmentName' ($source could not supply countryCode). Re-run with the 'country' input set (e.g. ch, w1), or grant the Entra app 'AdminCenter.ReadWrite.All' so the Admin Center API can be used."
+          }
+          $countryCode = $countryCode.ToLowerInvariant()
+
+          if (!$platformVersion) {
+            Write-Host "::warning::Platform version is unknown ($source does not report it). The 'System' symbols will be resolved from the application version instead."
+          }
+
+          Write-Host "Source              : $source"
+          Write-Host "Type                : $environmentType"
+          Write-Host "Status              : $status"
+          Write-Host "Localization        : $countryCode"
+          Write-Host "Application version : $applicationVersion"
+          Write-Host "Platform version    : $platformVersion"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "bcAccessToken=$token"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "tenantId=$tenantId"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "environmentName=$environmentName"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "applicationVersion=$applicationVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "platformVersion=$platformVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "countryCode=$countryCode"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## $environmentName`n`n| Property | Value |`n| --- | --- |`n| GitHub environment | $githubEnvironment |`n| Type | $environmentType |`n| Localization | $countryCode |`n| Application version | $applicationVersion |`n| Platform version | $platformVersion |`n| Source | $source |"
+
+      # ------------------------------------------------------------------
+      # Decide ONE target version for the whole run.
+      #
+      # WHY: the previous workflow resolved "latest" independently for every
+      # package (highest version on the feed) while labelling the report with a
+      # different number taken from Get-BCArtifactUrl. Different packages could
+      # end up on different releases and the report still claimed a single
+      # target. Here the target is decided once and every package is pinned to
+      # its major.minor.
+      # ------------------------------------------------------------------
+      - name: Resolve target version
+        id: resolveTarget
+        shell: pwsh
+        env:
+          country: ${{ steps.resolveEnvironment.outputs.countryCode }}
+          currentVersion: ${{ steps.resolveEnvironment.outputs.applicationVersion }}
+          requestedVersion: ${{ inputs.targetVersion }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $country = $env:country
+          $currentVersion = $env:currentVersion
+          $requested = $env:requestedVersion
+
+          if (-not (Get-Module -ListAvailable -Name BcContainerHelper)) {
+            Write-Host "Installing BcContainerHelper"
+            Install-Module -Name BcContainerHelper -Scope CurrentUser -Force -Confirm:$false
+          }
+          Import-Module BcContainerHelper -DisableNameChecking
+
+          if ($requested) {
+            $artifactUrl = Get-BCArtifactUrl -type Sandbox -country $country -version $requested -select Latest
+            if (!$artifactUrl) { throw "No sandbox artifact for version '$requested' in localization '$country'." }
+          }
+          else {
+            $artifactUrl = Get-BCArtifactUrl -type Sandbox -country $country -select Latest
+            if (!$artifactUrl) { throw "No sandbox artifact found for localization '$country'. Check the 'country' input." }
+          }
+
+          # .../sandbox/<version>/<country>
+          $targetVersion = ([Uri]$artifactUrl).AbsolutePath.Trim('/').Split('/')[1]
+          $parts = $targetVersion.Split('.')
+          $targetMajorMinor = "$($parts[0]).$($parts[1])"
+
+          Write-Host "Localization        : $country"
+          Write-Host "On the environment  : $currentVersion"
+          Write-Host "Target version      : $targetVersion (major.minor $targetMajorMinor)"
+          Write-Host "Artifact url        : $artifactUrl"
+
+          $updateAvailable = $false
+          if ($currentVersion) {
+            $updateAvailable = ([System.Version]$targetVersion -gt [System.Version]$currentVersion)
+          }
+          Write-Host "Update available    : $updateAvailable"
+          if (-not $updateAvailable) {
+            Write-Host "::notice::The target version is not newer than the version on the environment. The diff will legitimately be empty; this is not a tooling failure."
+          }
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "targetVersion=$targetVersion"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "targetMajorMinor=$targetMajorMinor"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "updateAvailable=$updateAvailable"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Target`n`n| Property | Value |`n| --- | --- |`n| On the environment | $currentVersion |`n| Target version | $targetVersion |`n| Update available | $updateAvailable |"
+
+      # ------------------------------------------------------------------
+      # Which Microsoft apps do we actually depend on?
+      #
+      # WHY this replaces the old "Read dependencies" step: that step wrote a
+      # text file and two outputs nobody consumed, while the download step
+      # re-read every app.json from scratch. One pass, one result, used twice.
+      # ------------------------------------------------------------------
+      - name: Resolve project dependencies
+        id: resolveDependencies
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $outputFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+          New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
+
+          $excludedFolders = @('.alpackages', '.snapshots', '.git', 'node_modules', '.output', $env:outputRoot)
+          $appJsonFiles = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter 'app.json' -Recurse -File |
+            Where-Object {
+              $pathParts = $_.FullName.Split([char]'\', [char]'/')
+              -not ($pathParts | Where-Object { $excludedFolders -contains $_ })
+            })
+          if ($appJsonFiles.Count -eq 0) { throw "No app.json found in the repository." }
+
+          $wanted = @()
+          $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+          $dependencyLines = @()
+
+          foreach($appJsonFile in $appJsonFiles) {
+            $app = Get-Content -Path $appJsonFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $appFolder = $appJsonFile.Directory.FullName.Substring($env:GITHUB_WORKSPACE.Length).TrimStart('\','/')
+            Write-Host "=== $($app.name) $($app.version) by $($app.publisher) ($appFolder) ==="
+            Write-Host "  platform    : $($app.platform)"
+            Write-Host "  application : $($app.application)"
+
+            function Add-Wanted([string] $publisher, [string] $name, [string] $declaredVersion, [string] $appId) {
+              if (!$name) { return }
+              if ($publisher -ne 'Microsoft') {
+                Write-Host "  skip $publisher / $name - only Microsoft symbols are published on the MSSymbols feed"
+                return
+              }
+              if (!$seen.Add($name)) { return }
+              $script:wanted += [PSCustomObject]@{ publisher = $publisher; name = $name; declaredVersion = $declaredVersion; appId = $appId }
+            }
+
+            if ($app.PSObject.Properties.Name -contains 'platform' -and $app.platform) {
+              Add-Wanted 'Microsoft' 'System' $app.platform '8874ed3a-0643-4247-9ced-7a7002f7135d'
+            }
+            if ($app.PSObject.Properties.Name -contains 'application' -and $app.application) {
+              Add-Wanted 'Microsoft' 'Application' $app.application 'c1335042-3002-4257-bf8a-75c898ccb1b8'
+              Add-Wanted 'Microsoft' 'Base Application' $app.application ''
+            }
+            if ($app.PSObject.Properties.Name -contains 'dependencies' -and $app.dependencies) {
+              foreach($dependency in @($app.dependencies)) {
+                $appId = ''
+                foreach($idName in @('id','appId')) {
+                  if ($dependency.PSObject.Properties.Name -contains $idName -and $dependency."$idName") { $appId = $dependency."$idName"; break }
+                }
+                Write-Host "    - $($dependency.publisher) / $($dependency.name) $($dependency.version) [$appId]"
+                $dependencyLines += "$($app.name);$($dependency.publisher);$($dependency.name);$($dependency.version);$appId"
+                Add-Wanted $dependency.publisher $dependency.name $dependency.version $appId
+              }
+            }
+          }
+
+          if ($wanted.Count -eq 0) { throw "No Microsoft dependency could be derived from app.json - nothing to compare." }
+          Write-Host "Microsoft apps to compare: $($wanted.Count)"
+
+          $wantedJson = ConvertTo-Json -InputObject @($wanted) -Depth 5 -Compress
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "wantedJson=$wantedJson"
+
+          $dependencyFile = Join-Path $outputFolder 'dependencies.txt'
+          Set-Content -Encoding UTF8 -Path $dependencyFile -Value "app;publisher;dependency;version;id"
+          foreach($line in $dependencyLines) { Add-Content -Encoding UTF8 -Path $dependencyFile -Value $line }
+
+      # ------------------------------------------------------------------
+      # Download two sets of symbols from the public MSSymbols feed: the version
+      # on the environment, and the target version.
+      #
+      # The feed is anonymous and keeps every released version, a symbol package
+      # is a few MB against 1-2 GB for a full artifact, and unlike the dev
+      # endpoint it serves versions other than the one the environment happens
+      # to run. The BC token is needed only to ask the environment what it has
+      # installed - it is never sent to the feed.
+      # ------------------------------------------------------------------
+      - name: Download symbols
+        id: downloadSymbols
+        shell: pwsh
+        env:
+          bcAccessToken: ${{ steps.resolveEnvironment.outputs.bcAccessToken }}
+          tenantId: ${{ steps.resolveEnvironment.outputs.tenantId }}
+          environmentName: ${{ steps.resolveEnvironment.outputs.environmentName }}
+          platformVersion: ${{ steps.resolveEnvironment.outputs.platformVersion }}
+          country: ${{ steps.resolveEnvironment.outputs.countryCode }}
+          targetVersion: ${{ steps.resolveTarget.outputs.targetVersion }}
+          targetMajorMinor: ${{ steps.resolveTarget.outputs.targetMajorMinor }}
+          wantedJson: ${{ steps.resolveDependencies.outputs.wantedJson }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $rootFolder = Join-Path $env:GITHUB_WORKSPACE $env:outputRoot
+          $currentFolder = Join-Path $rootFolder 'symbols/current'
+          $targetFolder = Join-Path $rootFolder 'symbols/target'
+          $reportFolder = Join-Path $rootFolder 'report'
+          foreach($folder in @($rootFolder, $currentFolder, $targetFolder, $reportFolder)) {
+            New-Item -Path $folder -ItemType Directory -Force | Out-Null
+          }
+
+          $headers = @{ Authorization = "Bearer $($env:bcAccessToken)" }
+          $environmentName = $env:environmentName
+          $country = $env:country
+          $cc = $country.ToUpperInvariant()
+          $targetMajorMinor = $env:targetMajorMinor
+          $wanted = @($env:wantedJson | ConvertFrom-Json)
+
+          # --- The symbols feed (anonymous - never send the BC token here) ---
+          $feedUrl = 'https://dynamicssmb2.pkgs.visualstudio.com/DynamicsBCPublicFeeds/_packaging/MSSymbols/nuget/v3/index.json'
+          $feedIndex = Invoke-RestMethod -Method Get -Uri $feedUrl
+          $searchService = ''; $packageBase = ''
+          foreach($resource in $feedIndex.resources) {
+            if ($resource.'@type' -eq 'SearchQueryService/3.0.0-beta') { $searchService = $resource.'@id' }
+            if ($resource.'@type' -eq 'PackageBaseAddress/3.0.0') { $packageBase = $resource.'@id' }
+          }
+          if (!$searchService -or !$packageBase) { throw "Could not read the search/download endpoints from $feedUrl." }
+
+          # --- What does the environment actually have installed? ---
+          $automationApi = "https://api.businesscentral.dynamics.com/v2.0/$($env:tenantId)/$environmentName/api/microsoft/automation/v2.0"
+          $companies = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies" -Headers $headers).value)
+          if ($companies.Count -eq 0) { throw "No companies returned from $automationApi/companies" }
+          $installedApps = @((Invoke-RestMethod -Method Get -Uri "$automationApi/companies($($companies[0].id))/extensions" -Headers $headers).value)
+          Write-Host "Apps installed on $environmentName : $($installedApps.Count)"
+
+          function Get-InstalledApp([string] $name, [string] $appId) {
+            $match = $null
+            if ($appId) { $match = $installedApps | Where-Object { "$($_.id)" -eq $appId } | Select-Object -First 1 }
+            if (!$match -and $name) { $match = $installedApps | Where-Object { $_.displayName -eq $name } | Select-Object -First 1 }
+            if ($match -and $match.PSObject.Properties.Name -contains 'isInstalled' -and !$match.isInstalled) { return $null }
+            return $match
+          }
+
+          # --- Resolve every wanted app against what the environment really has ---
+          $toDownload = @(); $skipped = @()
+          foreach($item in $wanted) {
+            $installedApp = Get-InstalledApp $item.name $item.appId
+            if (!$installedApp) {
+              # The platform app ("System") is not an extension, so it never appears in the list
+              if ($item.name -eq 'System') {
+                $systemVersion = $env:platformVersion
+                if (!$systemVersion) { $systemVersion = $item.declaredVersion }
+                $toDownload += [PSCustomObject]@{ name = 'System'; version = $systemVersion; declaredVersion = $item.declaredVersion; appId = $item.appId }
+              }
+              else {
+                Write-Host "::warning::$($item.name) is not installed on $environmentName - not compared."
+                $skipped += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "not installed on $environmentName" }
+              }
+              continue
+            }
+            if ($installedApp.publisher -ne 'Microsoft') {
+              Write-Host "::warning::$($item.name) is published by $($installedApp.publisher) on $environmentName - not compared."
+              $skipped += [PSCustomObject]@{ name = $item.name; declaredVersion = $item.declaredVersion; reason = "publisher is $($installedApp.publisher)" }
+              continue
+            }
+            $installedVersion = "$($installedApp.versionMajor).$($installedApp.versionMinor).$($installedApp.versionBuild).$($installedApp.versionRevision)"
+            if ($item.declaredVersion -and ([System.Version]$installedVersion -lt [System.Version]$item.declaredVersion)) {
+              Write-Host "::warning::$($item.name) is $installedVersion on $environmentName but app.json requires $($item.declaredVersion)."
+            }
+            $toDownload += [PSCustomObject]@{ name = $item.name; version = $installedVersion; declaredVersion = $item.declaredVersion; appId = "$($installedApp.id)" }
+          }
+
+          # --- Map each app onto a feed package id ---
+          # Ids are Microsoft.<Name>[.<CC>].symbols.<appId>; the variant without a
+          # country segment is W1. The two framework packages carry no appId:
+          # Microsoft.Platform.symbols and Microsoft.Application[.<CC>].symbols.
+          function Get-PackageIdCandidates([string] $name, [string] $appId) {
+            if ($name -eq 'System') { return @('Microsoft.Platform.symbols') }
+            if ($name -eq 'Application') {
+              if ($country -eq 'w1') { return @('Microsoft.Application.symbols') }
+              return @("Microsoft.Application.$cc.symbols", 'Microsoft.Application.symbols')
+            }
+            if (!$appId) { return @() }
+            $ids = @()
+            try {
+              $result = Invoke-RestMethod -Method Get -Uri "$searchService`?q=$appId&take=100&prerelease=true"
+              if ($result.PSObject.Properties.Name -contains 'data' -and $result.data) {
+                $ids = @($result.data | ForEach-Object { $_.id } | Where-Object { $_.EndsWith(".symbols.$appId", 'OrdinalIgnoreCase') })
+              }
+            }
+            catch { Write-Host "  feed search failed for $appId - $($_.Exception.Message)" }
+            if ($ids.Count -eq 0) { return @() }
+            $candidates = @()
+            if ($country -ne 'w1') { $candidates += @($ids | Where-Object { $_.EndsWith(".$cc.symbols.$appId", 'OrdinalIgnoreCase') }) }
+            # The W1 variant has no country segment, so it is the shortest id
+            $candidates += @($ids | Sort-Object { $_.Length } | Select-Object -First 1)
+            return @($candidates | Select-Object -Unique)
+          }
+
+          $versionCache = @{}
+          function Get-PackageVersions([string] $packageId) {
+            $lowerId = $packageId.ToLowerInvariant()
+            if ($versionCache.ContainsKey($lowerId)) { return $versionCache[$lowerId] }
+            $versions = @()
+            try {
+              $result = Invoke-RestMethod -Method Get -Uri "$packageBase$lowerId/index.json"
+              if ($result.PSObject.Properties.Name -contains 'versions' -and $result.versions) { $versions = @($result.versions) }
+            }
+            catch { Write-Host "  no version index for $packageId" }
+            $versionCache[$lowerId] = $versions
+            return $versions
+          }
+
+          function ConvertTo-ComparableVersion([string] $text) {
+            # Platform versions are 3-part, app versions 4-part. Strip any
+            # prerelease suffix from a segment rather than discarding the segment.
+            $parts = @($text.Split('.') | ForEach-Object { ($_ -split '[^0-9]')[0] } | ForEach-Object { if ($_) { $_ } else { '0' } })
+            while ($parts.Count -lt 4) { $parts += '0' }
+            return [System.Version]::Parse(($parts[0..3] -join '.'))
+          }
+
+          # Resolve a version within a fixed major.minor. Never silently jumps to
+          # another release: if the release is absent, the caller is told.
+          function Select-FeedVersion([string[]] $versions, [string] $majorMinor, [string] $preferExact) {
+            if ($versions.Count -eq 0) { return '' }
+            $ordered = @($versions | Sort-Object -Property @{ Expression = { ConvertTo-ComparableVersion $_ } } -Descending)
+            if ($preferExact) {
+              $wantedVersion = ConvertTo-ComparableVersion $preferExact
+              $exact = $ordered | Where-Object { (ConvertTo-ComparableVersion $_) -eq $wantedVersion } | Select-Object -First 1
+              if ($exact) { return $exact }
+            }
+            $prefix = "$majorMinor."
+            $match = $ordered | Where-Object { $_.StartsWith($prefix) } | Select-Object -First 1
+            if ($match) { return $match }
+            return ''
+          }
+
+          $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          function Save-SymbolPackage([string] $packageId, [string] $version, [string] $folder) {
+            $lowerId = $packageId.ToLowerInvariant()
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "$lowerId.$version.nupkg"
+            $extracted = @()
+            try {
+              Invoke-WebRequest -Uri "$packageBase$lowerId/$version/$lowerId.$version.nupkg" -OutFile $tempFile -UseBasicParsing
+              $zip = [System.IO.Compression.ZipFile]::OpenRead($tempFile)
+              try {
+                foreach($entry in $zip.Entries) {
+                  if ([System.IO.Path]::GetExtension($entry.Name) -ne '.app') { continue }
+                  $fileName = ($entry.Name.Split($invalidChars) -join '')
+                  $target = Join-Path $folder $fileName
+                  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                  $extracted += $target
+                }
+              }
+              finally { $zip.Dispose() }
+            }
+            finally { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+            return $extracted
+          }
+
+          $resolution = @(); $failed = @()
+          foreach($item in $toDownload) {
+            $packageId = ''; $versions = @()
+            foreach($candidate in @(Get-PackageIdCandidates $item.name $item.appId)) {
+              $versions = @(Get-PackageVersions $candidate)
+              if ($versions.Count -gt 0) { $packageId = $candidate; break }
+            }
+            if (!$packageId) {
+              Write-Host "::warning::No symbol package on the feed for $($item.name) [$($item.appId)] - not compared."
+              $failed += [PSCustomObject]@{ name = $item.name; reason = 'not published on the MSSymbols feed' }
+              continue
+            }
+
+            $itemMajorMinor = ($item.version.Split('.')[0..1] -join '.')
+            $currentVersion = Select-FeedVersion $versions $itemMajorMinor $item.version
+            $targetPackageVersion = Select-FeedVersion $versions $targetMajorMinor ''
+
+            Write-Host "$($item.name) -> $packageId"
+            Write-Host "  on $environmentName : $($item.version) -> feed $currentVersion"
+            Write-Host "  target $targetMajorMinor : $targetPackageVersion"
+
+            if (!$currentVersion -or !$targetPackageVersion) {
+              $missing = @()
+              if (!$currentVersion) { $missing += "the version on the environment ($($item.version))" }
+              if (!$targetPackageVersion) { $missing += "the target release ($targetMajorMinor)" }
+              Write-Host "::warning::$($item.name): the feed has no build for $($missing -join ' and ') - not compared. Comparing against a different release would misreport the diff."
+              $failed += [PSCustomObject]@{ name = $item.name; reason = "feed has no build for $($missing -join ' and ')" }
+              continue
+            }
+            if ($currentVersion -ne $item.version) {
+              Write-Host "::warning::$($item.name): the exact build $($item.version) is not on the feed; using $currentVersion from the same release."
+            }
+
+            $downloaded = $true
+            foreach($target in @(
+                [PSCustomObject]@{ label = 'current'; version = $currentVersion;       folder = $currentFolder },
+                [PSCustomObject]@{ label = 'target';  version = $targetPackageVersion; folder = $targetFolder })) {
+              try {
+                $files = @(Save-SymbolPackage $packageId $target.version $target.folder)
+                if ($files.Count -eq 0) { throw "the package contains no .app file" }
+                foreach($file in $files) {
+                  Write-Host "  [$($target.label)] $([System.IO.Path]::GetFileName($file)) ($([Math]::Round((Get-Item $file).Length / 1MB, 2)) MB)"
+                }
+              }
+              catch {
+                $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                Write-Host "::warning::Could not download $packageId $($target.version) ($($target.label)) - $reason"
+                $failed += [PSCustomObject]@{ name = $item.name; reason = "$($target.label) $($target.version): $reason" }
+                $downloaded = $false
+              }
+            }
+            if ($downloaded) {
+              $resolution += [PSCustomObject]@{
+                name = $item.name; packageId = $packageId
+                onEnvironment = $item.version; currentFeedVersion = $currentVersion
+                targetFeedVersion = $targetPackageVersion
+                approximated = ($currentVersion -ne $item.version)
+              }
+            }
+          }
+
+          # ------------------------------------------------------------------
+          # GATE 3 - both sides must exist before anything is diffed.
+          # ------------------------------------------------------------------
+          if ($resolution.Count -eq 0) {
+            throw "No package could be resolved on both sides. Nothing can be compared - see the warnings above."
+          }
+          Write-Host "Comparable packages : $($resolution.Count) (skipped $($skipped.Count + $failed.Count))"
+
+          $resolutionFile = Join-Path $reportFolder 'resolution.json'
+          Set-Content -Encoding UTF8 -Path $resolutionFile -Value (ConvertTo-Json -InputObject @{
+            environment = $environmentName; localization = $country
+            targetMajorMinor = $targetMajorMinor
+            compared = @($resolution); skipped = @($skipped + $failed)
+          } -Depth 5)
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "currentFolder=$currentFolder"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "targetFolder=$targetFolder"
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Symbols compared ($($resolution.Count))`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | On the environment | Feed (current) | Feed (target) | Exact |`n| --- | --- | --- | --- | --- |"
+          foreach($item in $resolution) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.onEnvironment) | $($item.currentFeedVersion) | $($item.targetFeedVersion) | $(if ($item.approximated) { 'approximated' } else { 'yes' }) |"
+          }
+          if (($skipped.Count + $failed.Count) -gt 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Not compared ($($skipped.Count + $failed.Count))`n"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| App | Reason |`n| --- | --- |"
+            foreach($item in ($skipped + $failed)) {
+              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| $($item.name) | $($item.reason) |"
+            }
+          }
+
+      # ------------------------------------------------------------------
+      # GATE 4 - the structured diff itself.
+      #
+      # diff_symbols.py flattens the namespace tree, keys objects by Id, and
+      # normalises members down to a full signature, so a changed event
+      # signature, a var flip, a demoted method, a shifted enum ordinal or an
+      # altered CalcFormula all show up. It exits non-zero if it extracted zero
+      # objects, so a broken parser fails the run instead of reporting "no
+      # breaking changes".
+      # ------------------------------------------------------------------
+      - name: Diff symbols
+        id: diffSymbols
+        shell: pwsh
+        env:
+          currentFolder: ${{ steps.downloadSymbols.outputs.currentFolder }}
+          targetFolder: ${{ steps.downloadSymbols.outputs.targetFolder }}
+          environmentName: ${{ steps.resolveEnvironment.outputs.environmentName }}
+          currentVersion: ${{ steps.resolveEnvironment.outputs.applicationVersion }}
+          targetVersion: ${{ steps.resolveTarget.outputs.targetVersion }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+
+          $reportFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+
+          python .github/scripts/diff_symbols.py diff `
+            --current "$($env:currentFolder)" `
+            --latest "$($env:targetFolder)" `
+            --out-dir "$reportFolder" `
+            --environment "$($env:environmentName)" `
+            --current-version "$($env:currentVersion)" `
+            --target-version "$($env:targetVersion)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The symbol diff failed (exit code $LASTEXITCODE). No report will be produced - see the error above."
+          }
+
+          $summary = Get-Content -Path (Join-Path $reportFolder 'summary.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Structured diff`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Metric | Value |`n| --- | --- |`n| Packages compared | $($summary.appsCompared) |`n| Objects read (old / new) | $($summary.oldObjects) / $($summary.newObjects) |`n| Breaking findings | $($summary.breaking) |`n| Data-behavior findings | $($summary.data) |`n| Obsolete findings | $($summary.obsolete) |`n| Objects removed / added | $($summary.removedObjects) / $($summary.addedObjects) |`n| Objects renamed / moved | $($summary.renamedObjects) / $($summary.movedObjects) |"
+
+      # ------------------------------------------------------------------
+      # Copilot turns the mechanical diff into an impact assessment scoped to
+      # our own AL source.
+      #
+      # WHY the .app folders are still handed over: the previous prompt declared
+      # the pre-computed diff "authoritative" and forbade unpacking any package.
+      # That removed the only check on the step that had actually broken. Here
+      # the diff is the starting point and reconciling it against the packages
+      # is part of the job.
+      # ------------------------------------------------------------------
+      - name: Analyze changes with Copilot
+        id: analyzeChanges
+        if: ${{ !inputs.skipCopilot }}
+        shell: pwsh
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          # Verify this slug against `copilot --help` before changing it; an
+          # unknown model makes the CLI exit non-zero and the step degrade to
+          # "diff only".
+          copilotModel: 'claude-opus-4.8'
+          # TODO: pin once a known-good version is agreed, so a bad release
+          # upstream cannot change this report overnight.
+          copilotVersion: 'latest'
+          currentFolder: ${{ steps.downloadSymbols.outputs.currentFolder }}
+          targetFolder: ${{ steps.downloadSymbols.outputs.targetFolder }}
+          environmentName: ${{ steps.resolveEnvironment.outputs.environmentName }}
+          currentVersion: ${{ steps.resolveEnvironment.outputs.applicationVersion }}
+          targetVersion: ${{ steps.resolveTarget.outputs.targetVersion }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $reportFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+          $deltaMarkdownFile = Join-Path $reportFolder 'symbol-changes.md'
+          $deltaJsonFile = Join-Path $reportFolder 'symbol-changes.json'
+          $summaryFile = Join-Path $reportFolder 'summary.json'
+          $resolutionFile = Join-Path $reportFolder 'resolution.json'
+          $reportFile = Join-Path $reportFolder 'copilot-analysis.md'
+          $stdoutFile = Join-Path $reportFolder 'copilot-stdout.txt'
+          $stderrFile = Join-Path $reportFolder 'copilot-stderr.log'
+
+          if (!$env:COPILOT_GITHUB_TOKEN) {
+            Write-Host "::warning::Secret COPILOT_GITHUB_TOKEN is not set - the structured diff is in the artifact, but no impact analysis was produced."
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis`n`nSkipped - COPILOT_GITHUB_TOKEN is not available to this job."
+            return
+          }
+
+          $instructionFile = Join-Path $env:GITHUB_WORKSPACE 'ALGo-App/Instructions/Compare-instruction.md'
+          if (!(Test-Path $instructionFile)) {
+            throw "$instructionFile not found. It is the format contract for this report - refusing to invent a layout."
+          }
+
+          Write-Host "Installing Copilot CLI ($($env:copilotVersion))"
+          npm install -g "@github/copilot@$($env:copilotVersion)" --no-fund --no-audit
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Could not install @github/copilot (npm exit code $LASTEXITCODE) - the structured diff is still in the artifact."
+            return
+          }
+
+          $prompt = @"
+          You are reviewing a Microsoft Dynamics 365 Business Central AL project before its
+          environment is upgraded. Base your answer only on the files in this repository and the
+          input files listed below - never on recalled Business Central internals.
+
+          Input files:
+          - $deltaMarkdownFile : readable diff of the Microsoft symbols between the version
+            running on $($env:environmentName) ($($env:currentVersion), the old version) and the
+            target version ($($env:targetVersion), the new version). Truncated for readability.
+          - $deltaJsonFile : the same diff, complete and unabridged, including normalised method
+            signatures, parameter lists, var-ness, visibility flags, enum ordinals and field
+            properties. Read or grep this whenever the markdown summary truncated what you need.
+          - $summaryFile : headline counts for the whole run.
+          - $resolutionFile : which feed build was used for each package, and which packages
+            could not be compared.
+          - $($env:currentFolder) and $($env:targetFolder) : the raw .app symbol packages the
+            diff was computed from.
+          - ALGo-App/ : the AL source of our own app, including app.json and its dependencies.
+
+          FIRST, a reconciliation pass. The diff was produced by
+          .github/scripts/diff_symbols.py, which is our own code and can be wrong:
+          - Compare the per-package object counts in $summaryFile against the size of the
+            packages in the two symbol folders. A large package reporting few or no objects
+            means the extractor failed, not that nothing changed.
+          - If any package reports zero objects, or the counts look implausible, unpack that
+            .app yourself (it is a 40-byte header followed by a zip; objects live nested inside
+            "Namespaces" in SymbolReference.json), count what is really there, and REPORT THE
+            INCONSISTENCY at the top of your answer instead of drawing conclusions from it.
+          - State explicitly in section 1 that this check was carried out and what it found.
+
+          OUTPUT FORMAT - MANDATORY. Read $instructionFile; it is the format contract.
+          - PHASE 1 (extraction) and PHASE 2 (structured diff) have already been carried out by
+            this workflow, subject to the reconciliation above.
+          - Apply PHASE 3 (breaking-change classification) to the diff, using its rules as
+            written. The diff already carries a mechanical 'category' per finding (breaking /
+            data / obsolete / additive) - treat it as a first pass to be checked, not as a
+            verdict.
+          - Emit the report in the PHASE 4 skeleton (sections 1-7 plus "Conclusion & action
+            items"), omitting any section with no data rather than writing "nothing here".
+          - Obey the section 5 WRITING RULES and run the section 6 SELF-CHECK before answering.
+
+          Deviations from the instruction file that apply to this run:
+          - Section 1 "Metadata": report the environment name, the version on the environment
+            ($($env:currentVersion), old), the target version ($($env:targetVersion), new), the
+            per-package old -> new versions, and the outcome of the reconciliation pass. There
+            is no manifest or compiler data in these inputs - omit those rows.
+          - Sections 3 and 6 must be scoped to our own app first: for every breaking or
+            data-behavior change, state whether the AL code in ALGo-App/ actually references
+            that object or member, and give the AL file and line when it does. Say so
+            explicitly when nothing in ALGo-App/ is affected.
+          - Objects that only moved namespace or were renamed keep their Id and are NOT
+            removals. Do not report them as breaking unless our code qualifies them by
+            namespace.
+          - Add a "### 8. New capabilities worth adopting" section before the conclusion:
+            additions in the new version that would let us simplify or replace code we
+            currently maintain in ALGo-App/.
+          - The closing checklist must name any required app.json platform, application or
+            dependency version bump.
+          - Packages listed as not compared in $resolutionFile are blind spots. List them in
+            the conclusion as unreviewed - never present the report as complete coverage.
+
+          Output the markdown report and nothing else.
+          "@
+
+          Write-Host "Running Copilot ($($env:copilotModel))"
+          # stdout is the report; stderr is CLI diagnostics and must not end up
+          # inside the report file.
+          & copilot -p $prompt --allow-all-tools --model $env:copilotModel 1> $stdoutFile 2> $stderrFile
+          $exitCode = $LASTEXITCODE
+
+          if (Test-Path $stderrFile) {
+            $stderr = Get-Content -Path $stderrFile -Raw -Encoding UTF8
+            if ($stderr) { Write-Host "--- copilot stderr ---"; Write-Host $stderr }
+          }
+
+          $output = ''
+          if (Test-Path $stdoutFile) { $output = Get-Content -Path $stdoutFile -Raw -Encoding UTF8 }
+          if ($exitCode -ne 0 -or !$output) {
+            Write-Host "::warning::Copilot exited with code $exitCode - see copilot-stderr.log in the artifact. The structured diff is unaffected."
+            return
+          }
+
+          Set-Content -Encoding UTF8 -Path $reportFile -Value $output
+          Write-Host "Wrote $reportFile"
+
+          # GITHUB_STEP_SUMMARY is capped at 1 MB - keep the summary readable and
+          # leave the full report to the artifact.
+          $summaryText = $output
+          $limit = 60000
+          if ($summaryText.Length -gt $limit) {
+            $summaryText = $summaryText.Substring(0, $limit) + "`n`n_(truncated - the full report is copilot-analysis.md in the artifact)_"
+          }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Copilot analysis: $($env:currentVersion) -> $($env:targetVersion)`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $summaryText
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-analysis-${{ inputs.environment }}
+          path: ${{ env.outputRoot }}/report/
+          if-no-files-found: warn
+
+      # The raw packages are ~60 MB per side and are only worth shipping when
+      # somebody wants to re-run the diff locally.
+      - name: Upload symbols
+        if: ${{ inputs.includeSymbols }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-symbols-${{ inputs.environment }}
+          path: ${{ env.outputRoot }}/symbols/
+          if-no-files-found: warn
