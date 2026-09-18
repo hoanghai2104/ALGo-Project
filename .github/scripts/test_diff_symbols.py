@@ -850,9 +850,15 @@ Two items must be handled before the upgrade. Risk level: MEDIUM.
 
 ## Our customizations affected (1)
 | # | Our customization | Where the user sees it | Area | What it means |
+| --- | --- | --- | --- | --- |
 | 1 | SalesHeaderExt | Sales Header | Sales | The standard table changed; re-test order entry |
 
 Checked 95 of 95 extension points and 55 of 55 event hooks.
+
+## Microsoft feature changes and deprecations (1)
+| # | What Microsoft is changing | When | Are we exposed? | Source |
+| --- | --- | --- | --- | --- |
+| 1 | API v1.0 is removed | this update | No - our API pages are all v2.0 | https://learn.microsoft.com/dynamics365/business-central/dev-itpro/upgrade/deprecated-features-w1 |
 
 ## Scope considered
 Sales, Service and Finance were examined.
@@ -881,6 +887,35 @@ check('the missing-section fixture really does differ from the clean one',
 output = run_check(RENAMED_SECTION)
 check('a missing required section is reported',
       'missing' in output and 'Conclusion' in output, '(got %r)' % output[-300:])
+
+check('the cited-sections block is read from the real contract',
+      'Microsoft feature changes and deprecations'
+      in ds.parse_fenced_list(contract, 'cited-sections') if os.path.isfile(INSTRUCTION)
+      else True)
+
+output = run_check(CLEAN_REPORT)
+check('a claim about Microsoft that carries its source URL passes',
+      'every line in a source-required section is sourced' in output,
+      '(got %r)' % output[-300:])
+
+UNSOURCED = CLEAN_REPORT.replace(
+    ' | https://learn.microsoft.com/dynamics365/business-central/dev-itpro/upgrade/'
+    'deprecated-features-w1 |', ' | |')
+check('the unsourced fixture really does differ', UNSOURCED != CLEAN_REPORT)
+output = run_check(UNSOURCED)
+check('a claim about Microsoft with no source URL is reported',
+      'unsourced' in output, '(got %r)' % output[-300:])
+
+# A GFM table header carries no claim, so it must not be flagged for a source.
+check('a table header row is not mistaken for a claim',
+      'What Microsoft is changing' not in run_check(CLEAN_REPORT))
+
+body = ds.extract_section(CLEAN_REPORT.splitlines(),
+                          'Microsoft feature changes and deprecations')
+check('a section runs to the next heading of the same level',
+      body is not None and not any('Scope considered' in line for _n, line in body))
+check('a table separator row is not a claim',
+      all(not ds.is_table_separator(line) for _n, line in ds.substantive_lines(body)))
 
 output = run_check(CLEAN_REPORT, CLEAN_REPORT)
 check('a functional report identical to the technical one is reported',

@@ -1811,6 +1811,67 @@ def parse_fenced_list(text, language):
     return [line.strip() for line in match.group(1).splitlines() if line.strip()]
 
 
+def heading_depth(line):
+    stripped = line.lstrip()
+    if not stripped.startswith('#'):
+        return 0
+    return len(stripped) - len(stripped.lstrip('#'))
+
+
+def extract_section(lines, heading):
+    """[(line number, text)] for the section whose heading contains `heading`.
+
+    The section runs to the next heading at the same level or shallower, so a
+    subsection stays part of it.
+    """
+    needle = heading.lower()
+    start = None
+    level = 0
+    for index, line in enumerate(lines):
+        if heading_depth(line) and needle in line.lower():
+            start = index + 1
+            level = heading_depth(line)
+            break
+    if start is None:
+        return None
+
+    body = []
+    for index in range(start, len(lines)):
+        depth = heading_depth(lines[index])
+        if depth and depth <= level:
+            break
+        body.append((index + 1, lines[index]))
+    return body
+
+
+def is_table_separator(line):
+    stripped = line.strip()
+    return bool(stripped) and stripped.startswith('|') and set(stripped) <= set('|-: ')
+
+
+def substantive_lines(body):
+    """The lines in a section that make a claim, as opposed to layout.
+
+    A table's header row is the one immediately followed by the separator - the
+    GFM definition - which is more reliable than guessing from the words in it.
+    """
+    texts = [line for _number, line in body]
+    for position, (number, line) in enumerate(body):
+        stripped = line.strip()
+        if len(stripped) < 12:
+            continue
+        if is_table_separator(line):
+            continue
+        if position + 1 < len(texts) and is_table_separator(texts[position + 1]):
+            continue                                   # a table header row
+        if stripped.startswith('|'):
+            yield number, line
+            continue
+        if stripped.startswith(('-', '*')) or stripped[:2].rstrip('.').isdigit() \
+                or stripped[0].isalpha():
+            yield number, line
+
+
 def command_checkreport(args):
     """Check a written report against its own instruction file.
 
@@ -1834,7 +1895,8 @@ def command_checkreport(args):
 
     banned = parse_fenced_list(instruction, 'banned-vocabulary')
     required = parse_fenced_list(instruction, 'required-sections')
-    if not banned and not required:
+    cited = parse_fenced_list(instruction, 'cited-sections')
+    if not banned and not required and not cited:
         print('::warning::%s has no banned-vocabulary or required-sections block - '
               'the report cannot be checked.' % args.instruction)
         return 0
@@ -1873,6 +1935,28 @@ def command_checkreport(args):
               % (name, len(missing), ', '.join(missing)))
     else:
         print('  all required sections present')
+
+    # Sections that report what Microsoft announced, rather than what we
+    # measured, have to point at the page that says it. A claim about a vendor's
+    # product with no link behind it is exactly what a report like this must not
+    # contain, and it is cheap to check.
+    unsourced = []
+    for heading in cited:
+        body = extract_section(lines, heading)
+        if body is None:
+            continue
+        for number, line in substantive_lines(body):
+            if 'learn.microsoft.com' not in line:
+                unsourced.append((heading, number, line.strip()[:70]))
+    if cited:
+        if unsourced:
+            print('::warning::%s has %d line(s) in a source-required section with no '
+                  'learn.microsoft.com link: %s. Those statements about Microsoft are '
+                  'unsourced.' % (name, len(unsourced),
+                                  '; '.join('line %d "%s"' % (n, t)
+                                            for _, n, t in unsourced[:5])))
+        else:
+            print('  every line in a source-required section is sourced')
 
     if args.compare_with and os.path.isfile(args.compare_with):
         with open(args.compare_with, encoding='utf-8', errors='replace') as handle:

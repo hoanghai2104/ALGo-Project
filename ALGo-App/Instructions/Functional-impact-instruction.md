@@ -101,6 +101,13 @@ Our customizations affected
 Scope considered
 ```
 
+<!-- cited-sections: parsed by `diff_symbols.py checkreport`. Every substantive line inside
+     these sections must carry a learn.microsoft.com link, because the section states what
+     Microsoft announced rather than what we measured. One heading fragment per line. -->
+```cited-sections
+Microsoft feature changes and deprecations
+```
+
 - Quantities: always give the count next to a heading, so the reader can judge size
   before reading.
 - Never invent a finding. If `business-impact.json` does not contain it, it does not
@@ -177,6 +184,22 @@ be checked — do not leave it looking safe.
 Close the section with one sentence giving the coverage: how many of our
 `customization.extensionPoints` extension points and `customization.subscriptions` event
 hooks were checked, and how many were not.
+
+## 📣 Microsoft feature changes and deprecations  (n)
+| # | What Microsoft is changing | When | Are we exposed? | Source |
+Written from `release-notes.md` / `release-notes.json`, **not** from the symbol findings.
+This section covers what the symbol comparison cannot see: a feature becoming mandatory,
+an API version retired, a capability moved to another app, something deprecated now for
+removal later.
+- One row per feature change and per deprecation marked `in-window` or `future`.
+- "When" is `this update` for in-window, or the version it is removed in for future ones.
+- "Are we exposed?" must be answered, not left open: name what was checked. "No — our API
+  pages are all v2.0" is a result and belongs in the report.
+- **"Source" must contain the `learn.microsoft.com` URL on every row.** The workflow greps
+  this section for those links, and a row without one is reported as unsourced.
+- If `release-notes.json` has `available: false`, do not write this section from memory.
+  Replace it with one line saying the Microsoft notes could not be read, and list it as a
+  gap in the 🔍 section.
 
 ## 🟢 Opportunities to retire customization  (n)
 | New standard capability | Could replace | Notes |

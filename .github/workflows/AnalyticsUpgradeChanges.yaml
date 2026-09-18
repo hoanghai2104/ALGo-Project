@@ -97,6 +97,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "diff_symbols unit tests failed - refusing to run the analysis." }
 
           Write-Host ""
+          Write-Host "--- release-notes unit tests ---"
+          python .github/scripts/test_release_notes.py
+          if ($LASTEXITCODE -ne 0) { throw "release_notes unit tests failed - refusing to run the analysis." }
+
+          Write-Host ""
           Write-Host "--- self-test against real symbol packages, when present locally ---"
           python .github/scripts/diff_symbols.py selftest --symbols-dir ALGo-App/.alpackages
           if ($LASTEXITCODE -ne 0) { throw "The symbol extractor self-test failed - refusing to run the analysis." }
@@ -861,6 +866,44 @@ jobs:
           }
 
       # ------------------------------------------------------------------
+      # Read what Microsoft says about this update window.
+      #
+      # WHY: a whole class of upgrade impact never reaches the API surface, so
+      # the symbol diff is structurally blind to it - a feature switch becoming
+      # mandatory, an API version retired, a worksheet moved to another app, a
+      # capability deprecated now for removal two waves later. Microsoft Learn
+      # is the only source for those.
+      #
+      # The per-update pages have a fixed URL shape, so this fetches exactly the
+      # pages for the window rather than searching: the result is reproducible
+      # and the artifact records what Microsoft actually said, which is what
+      # keeps the report from resting on recalled detail.
+      #
+      # The Learn MCP server is public - no secret is needed. Network trouble is
+      # a warning, never a failure.
+      # ------------------------------------------------------------------
+      - name: Fetch Microsoft release notes
+        id: releaseNotes
+        shell: pwsh
+        env:
+          currentVersion: ${{ steps.resolveEnvironment.outputs.applicationVersion }}
+          targetVersion: ${{ steps.resolveTarget.outputs.targetVersion }}
+          country: ${{ steps.resolveEnvironment.outputs.countryCode }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+
+          $reportFolder = Join-Path $env:GITHUB_WORKSPACE "$($env:outputRoot)/report"
+
+          python .github/scripts/release_notes.py fetch `
+            --current-version "$($env:currentVersion)" `
+            --target-version "$($env:targetVersion)" `
+            --country "$($env:country)" `
+            --out-dir "$reportFolder"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Fetching the Microsoft release notes exited with code $LASTEXITCODE. The symbol analysis is unaffected, but the report will be missing the feature and deprecation notes."
+          }
+
+      # ------------------------------------------------------------------
       # Copilot turns the mechanical diff into an impact assessment scoped to
       # our own AL source.
       #
@@ -899,6 +942,8 @@ jobs:
           $resolutionFile = Join-Path $reportFolder 'resolution.json'
           $businessJsonFile = Join-Path $reportFolder 'business-impact.json'
           $footprintFile = Join-Path $reportFolder 'customization-footprint.json'
+          $releaseNotesFile = Join-Path $reportFolder 'release-notes.md'
+          $releaseNotesJsonFile = Join-Path $reportFolder 'release-notes.json'
           $technicalReportFile = Join-Path $reportFolder 'technical-analysis.md'
           $functionalReportFile = Join-Path $reportFolder 'functional-impact.md'
           $stdoutFile = Join-Path $reportFolder 'copilot-stdout.txt'
@@ -960,6 +1005,12 @@ jobs:
           - $summaryFile : headline counts for the whole run.
           - $resolutionFile : which feed build was used for each package, and which packages
             could not be compared.
+          - $releaseNotesFile and $releaseNotesJsonFile : what MICROSOFT says about the
+            updates in this window, fetched from Microsoft Learn. This covers the changes the
+            symbol diff cannot see at all - features becoming mandatory, API versions retired,
+            capabilities moved to another app, and deprecations announced now for removal in a
+            later version. Every page carries its source URL. If 'available' is false, say the
+            notes are missing; do NOT fill the gap from memory.
           - $($env:currentFolder) and $($env:targetFolder) : the raw .app symbol packages.
           - ALGo-App/ : the AL source of our own app, including app.json and its dependencies.
 
@@ -1009,8 +1060,16 @@ jobs:
               matters is the field, not the event name.
             * "### 11. Work by file" - the byFile totals, sorted by needsAction descending, so
               the work can be assigned.
+          - Add "### 12. Microsoft feature changes and deprecations", written from
+            $releaseNotesFile - the feature changes in the window, and every deprecation
+            marked 'in-window' or 'future'. For each one, say whether ALGo-App/ is exposed and how you checked -
+            a deprecation of API v1.0 is answered by the APIVersion in our own API pages, a
+            deprecated report by whether we extend it. "Not exposed, checked X" is a result
+            worth printing. Cite the source URL on every row.
           - Any 'not-analysed' row must also appear in the conclusion's blind-spot list. Never
             describe a not-analysed extension point as unaffected.
+          - Deprecations marked 'future' belong in the closing checklist as planned work, with
+            the version they are removed in.
           - The closing checklist must name any required app.json platform, application or
             dependency version bump.
           - Packages listed as not compared in $resolutionFile are blind spots; list them in
@@ -1023,10 +1082,13 @@ jobs:
 
           THIS IS NOT A SHORTER VERSION OF REPORT 1. It is a different document for a different
           reader, and these rules are absolute:
-          - Write it from $businessJsonFile. Do not read findings out of $deltaJsonFile for
-            this report - that file is already summarised for you, filtered, tiered and
-            translated into on-screen names. Anything not in $businessJsonFile does not belong
-            in this report.
+          - Write it from $businessJsonFile and $releaseNotesFile. Do not read findings out of
+            $deltaJsonFile for this report - that file is already summarised for you, filtered,
+            tiered and translated into on-screen names. A finding must come from
+            $businessJsonFile; a statement about a Microsoft feature or deprecation must come
+            from $releaseNotesFile and must carry its learn.microsoft.com URL. Keep the two
+            apart: one says what changed in the product surface we measured, the other says
+            what Microsoft announced. Never merge them into one claim.
           - Use ALGo-App/ only to answer "does our customization use this" and "could this new
             standard feature replace something we maintain".
           - Name every object by its 'objectLabel' - the Caption the user sees on screen -
