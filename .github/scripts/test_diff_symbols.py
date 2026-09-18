@@ -591,6 +591,12 @@ if os.path.isfile(INSTRUCTION):
           '(got %r)' % banned)
     check('the required-sections block is read from the real contract',
           len(required) >= 3, '(got %r)' % required)
+    # The contract sets the report language. Its required-sections block has to
+    # name the headings actually written, or the check warns on every clean run.
+    check('required-sections match the headings in the contract\'s own section 5',
+          all(heading in contract for heading in required),
+          '(not found in section 5: %r)'
+          % [h for h in required if h not in contract])
 else:
     banned, required = [], []
 
@@ -623,21 +629,21 @@ def run_check(report_text, compare_text=None):
     return buffer.getvalue()
 
 
-CLEAN_REPORT = """# Đánh giá tác động nghiệp vụ
+CLEAN_REPORT = """# Functional impact assessment
 
-## Kết luận
-Hai điểm phải xử lý trước khi nâng cấp.
+## Conclusion
+Two items must be handled before the upgrade. Risk level: MEDIUM.
 
-## Phải xử lý trước khi nâng cấp (1)
-| # | Ảnh hưởng nghiệp vụ | Vùng |
-| 1 | Trường "Technician" trên Sales Header bị bỏ | Sales |
+## Must be handled before the upgrade (1)
+| # | Business impact | Area | Owner |
+| 1 | The "Technician" field on Sales Header has been removed | Sales | Developer |
 
-## Cần kiểm thử lại (1)
-| # | Quy trình cần kiểm thử | Vì sao |
-| 1 | Tạo và post Sales Order | Cách tính thay đổi |
+## Needs re-testing (1)
+| # | Process to test | Why | Area | Priority |
+| 1 | Create and post a sales order | A calculation changed | Sales | High |
 
-## Phạm vi đã xét
-Sales, Service, Finance.
+## Scope considered
+Sales, Service and Finance were examined.
 """
 
 output = run_check(CLEAN_REPORT)
@@ -646,15 +652,23 @@ check('a clean report reports no banned vocabulary',
 check('a clean report reports all sections present',
       'all required sections present' in output)
 
-output = run_check(CLEAN_REPORT.replace('Trường "Technician"',
-                                        'The namespace of the codeunit signature'))
+LEAKY = CLEAN_REPORT.replace(
+    'The "Technician" field on Sales Header has been removed',
+    'The namespace of the codeunit changed and its signature no longer matches')
+check('the leak fixture really does differ from the clean one', LEAKY != CLEAN_REPORT)
+
+output = run_check(LEAKY)
 check('leaked developer vocabulary is reported',
-      '::warning::' in output and 'namespace' in output)
+      '::warning::' in output and 'namespace' in output, '(got %r)' % output[-300:])
 check('the leak report gives a line number', 'first at line' in output)
 
-output = run_check(CLEAN_REPORT.replace('## Kết luận', '## Tóm tắt'))
+RENAMED_SECTION = CLEAN_REPORT.replace('## Conclusion', '## Summary')
+check('the missing-section fixture really does differ from the clean one',
+      RENAMED_SECTION != CLEAN_REPORT)
+
+output = run_check(RENAMED_SECTION)
 check('a missing required section is reported',
-      'missing' in output and 'Kết luận' in output)
+      'missing' in output and 'Conclusion' in output, '(got %r)' % output[-300:])
 
 output = run_check(CLEAN_REPORT, CLEAN_REPORT)
 check('a functional report identical to the technical one is reported',
@@ -681,13 +695,32 @@ check('an unwritten report is a warning, not a failure',
 
 print('\nReport check - non-ASCII output survives a legacy console codepage')
 
-# The section headings in the contract are Vietnamese. On Windows, Python writes
-# a redirected stdout in the locale codepage, so printing them raised
-# UnicodeEncodeError and failed the workflow step. Redirecting stdout to a
-# StringIO inside this process cannot catch that, so run the real script the way
-# the workflow does, with a legacy codepage forced.
+# On Windows, Python writes a redirected stdout in the locale codepage, so
+# printing a non-ASCII section name or object caption raised UnicodeEncodeError
+# and failed the workflow step. Redirecting stdout to a StringIO inside this
+# process cannot catch that, so the real script is run the way the workflow runs
+# it, with a legacy codepage forced.
+#
+# The contract's own language is not what is under test here - it can be
+# translated at any time - so this uses a contract with deliberately non-ASCII
+# headings. Object captions from a localised Business Central (Écritures,
+# Zahlungsavis) reach stdout the same way.
+NON_ASCII_CONTRACT = """# Contract
+
+```banned-vocabulary
+namespace
+```
+
+```required-sections
+Kết luận
+Écritures comptables
+Zahlungsavis prüfen
+```
+"""
+
+contract_path = write_temp(NON_ASCII_CONTRACT.encode('utf-8'), suffix='.md')
 bad_report = write_temp(
-    '# Report\n\n## Tong ket\n\nNothing here matches the contract.\n'.encode('utf-8'),
+    '# Report\n\n## Summary\n\nNothing here matches the contract.\n'.encode('utf-8'),
     suffix='.md')
 try:
     environment = dict(os.environ)
@@ -696,9 +729,9 @@ try:
     completed = subprocess.run(
         [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       'diff_symbols.py'),
-         'checkreport', '--report', bad_report, '--instruction', INSTRUCTION],
+         'checkreport', '--report', bad_report, '--instruction', contract_path],
         env=environment, capture_output=True, text=True, encoding='utf-8', errors='replace')
-    check('a report missing Vietnamese sections does not crash on cp1252',
+    check('non-ASCII section names do not crash on a cp1252 stdout',
           completed.returncode == 0,
           '(exit %s, stderr tail: %r)' % (completed.returncode, completed.stderr[-300:]))
     check('the missing-section warning is still emitted',
@@ -706,6 +739,7 @@ try:
           '(stdout: %r)' % completed.stdout[-300:])
 finally:
     os.unlink(bad_report)
+    os.unlink(contract_path)
 
 print('')
 if FAILURES:

@@ -1101,7 +1101,7 @@ jobs:
           $artifactName = "upgrade-analysis-$($env:ALGoEnvName)"
           if ($functionalText) {
             $functionalText = Limit-Utf8 $functionalText (300KB) `
-              "_(cắt bớt - bản đầy đủ là functional-impact.md trong artifact ``$artifactName``)_"
+              "_(truncated - the full report is functional-impact.md in the ``$artifactName`` artifact)_"
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n"
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $functionalText
           }

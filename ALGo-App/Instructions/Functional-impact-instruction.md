@@ -5,8 +5,9 @@ counterpart of `Compare-instruction.md`, which is the contract for the technical
 A functional consultant owns this file: change the wording, the order, the severity
 labels or the output language here, and the workflow follows — no YAML edit needed.
 
-**Output language: Vietnamese.** To switch, change this line and the wording table in
-section 4; nothing else depends on it.
+**Output language: English.** To switch, change this line, the wording table in section 4,
+and the section headings in the `required-sections` block below so the mechanical check
+looks for the headings you actually write. Nothing else depends on it.
 
 ---
 
@@ -74,13 +75,16 @@ pure append
 breaking change
 ```
 
-<!-- required-sections: parsed by `diff_symbols.py checkreport`. One heading fragment per line. -->
+<!-- required-sections: parsed by `diff_symbols.py checkreport`. One heading fragment per
+     line. These must match the headings in section 5 - if you translate the report,
+     translate these too. -->
 ```required-sections
-Kết luận
-Phải xử lý trước khi nâng cấp
-Cần kiểm thử lại
-Phạm vi đã xét
+Conclusion
+Must be handled before the upgrade
+Needs re-testing
+Scope considered
 ```
+
 - Quantities: always give the count next to a heading, so the reader can judge size
   before reading.
 - Never invent a finding. If `business-impact.json` does not contain it, it does not
@@ -90,78 +94,84 @@ Phạm vi đã xét
 ## 4. Wording table — `consequenceCode` to a sentence
 
 Use these as the pattern; adapt the grammar, keep the meaning. `{label}` is
-`objectLabel`, `{member}` is `facts.memberLabel`, `{area}` is the business area.
+`objectLabel`, `{member}` is `facts.memberLabel`, `{old}` and `{new}` come from `facts`.
 
-| `consequenceCode` | Câu tiếng Việt |
+| `consequenceCode` | Sentence |
 |---|---|
-| `object-removed` | Microsoft đã bỏ {label}. Người dùng sẽ không còn tìm thấy nó ở chỗ cũ. |
-| `object-obsoleted` | {label} đã bị Microsoft đánh dấu ngừng sử dụng và sẽ bị bỏ ở bản sau. |
-| `field-removed` | Trường "{member}" trên {label} đã bị Microsoft bỏ. Dữ liệu và chức năng dựa vào trường này sẽ ngừng hoạt động. |
-| `field-obsoleted` | Trường "{member}" trên {label} sắp bị bỏ. Cần chuyển sang cách làm mới trước khi nó biến mất. |
-| `field-type-changed` | Kiểu dữ liệu của "{member}" trên {label} đã thay đổi. Dữ liệu cũ có thể không còn hợp lệ hoặc hiển thị sai. |
-| `calcformula-changed` | Cách tính "{member}" trên {label} đã thay đổi. **Số liệu có thể khác trước dù không ai sửa gì.** |
-| `tablerelation-changed` | Quan hệ dữ liệu của "{member}" trên {label} đã thay đổi. Danh sách chọn và kiểm tra hợp lệ có thể khác. |
-| `permissions-changed` | Quyền truy cập dữ liệu khi dùng {label} đã thay đổi. Một số người dùng có thể mất hoặc được thêm quyền. |
-| `dataclassification-changed` | Phân loại dữ liệu của {label} đã thay đổi. Có thể ảnh hưởng báo cáo tuân thủ và xử lý dữ liệu cá nhân. |
-| `data-scope-changed` | Phạm vi dữ liệu của {label} đã thay đổi (theo công ty / đồng bộ). Cần kiểm tra lại với môi trường nhiều công ty. |
-| `screen-behaviour-changed` | Cách hoạt động của {label} đã thay đổi (quyền sửa, thêm, xoá hoặc nguồn dữ liệu). |
-| `caption-changed` | Nhãn trên màn hình đổi từ "{old}" thành "{new}". Cần cập nhật tài liệu và hướng dẫn người dùng. |
-| `enum-value-removed` | Giá trị lựa chọn "{member}" của {label} đã bị bỏ. Bản ghi cũ đang dùng giá trị này sẽ không còn hợp lệ. |
-| `enum-ordinal-changed` | Giá trị lựa chọn của {label} đã được đánh số lại. Dữ liệu cũ có thể hiển thị sai giá trị. |
-| `enum-not-extensible` | {label} không còn cho phép mở rộng. Các giá trị tuỳ chỉnh đã thêm sẽ không còn dùng được. |
-| `access-restricted` | {label} đã bị Microsoft giới hạn truy cập. Phần tuỳ chỉnh đang dùng nó cần được viết lại. |
-| `integration-point-changed` | Điểm tích hợp mà phần tuỳ chỉnh đang dùng trên {label} đã thay đổi. **Lập trình viên phải sửa trước khi nâng cấp**, nếu không chức năng liên quan sẽ ngừng chạy. |
-| `method-removed-used` | Một chức năng nội bộ mà phần tuỳ chỉnh đang gọi trên {label} đã bị bỏ. Lập trình viên phải thay thế trước khi nâng cấp. |
-| `object-added` | Tính năng mới: {label}. |
-| `enum-value-added` | {label} có thêm lựa chọn mới: "{member}". |
+| `object-removed` | Microsoft has removed {label}. Users will no longer find it where it used to be. |
+| `object-obsoleted` | {label} has been marked for removal by Microsoft and will disappear in a later release. |
+| `field-removed` | The "{member}" field on {label} has been removed by Microsoft. Data and functionality that rely on it will stop working. |
+| `field-obsoleted` | The "{member}" field on {label} is being retired. It needs to be replaced before it disappears. |
+| `field-type-changed` | The data type of "{member}" on {label} has changed. Existing data may no longer be valid or may display incorrectly. |
+| `calcformula-changed` | How "{member}" on {label} is calculated has changed. **Figures may differ from before even though nobody changed anything.** |
+| `tablerelation-changed` | The data relationship behind "{member}" on {label} has changed. Lookups and validation may behave differently. |
+| `permissions-changed` | Data access when using {label} has changed. Some users may gain or lose access. |
+| `dataclassification-changed` | The data classification of {label} has changed. This can affect compliance reporting and how personal data is handled. |
+| `data-scope-changed` | The data scope of {label} has changed (per-company or replication). Re-check this in a multi-company environment. |
+| `screen-behaviour-changed` | How {label} behaves has changed (whether records can be edited, added or deleted, or which data it shows). |
+| `caption-changed` | The on-screen label changed from "{old}" to "{new}". User documentation and training material need updating. |
+| `enum-value-removed` | The "{member}" option on {label} has been removed. Existing records using that option will no longer be valid. |
+| `enum-ordinal-changed` | The options behind {label} have been renumbered. Existing data may display the wrong value. |
+| `enum-not-extensible` | {label} can no longer be extended. Any custom options added to it will stop working. |
+| `access-restricted` | Microsoft has restricted access to {label}. The customization that uses it has to be rewritten. |
+| `integration-point-changed` | The integration point the customization relies on in {label} has changed. **A developer must fix this before the upgrade**, otherwise the related functionality will stop running. |
+| `method-removed-used` | An internal function the customization calls on {label} has been removed. A developer must replace it before the upgrade. |
+| `object-added` | New capability: {label}. |
+| `enum-value-added` | {label} has a new option: "{member}". |
 
 ## 5. Output structure
 
 Write exactly these sections, in this order. **Omit a section that has no data** — do
-not write "không có gì ở đây".
+not write "nothing here".
 
 ```
-# Đánh giá tác động nghiệp vụ — nâng cấp <environment>
-<currentVersion> → <targetVersion> · <ngày> · độ phủ: <n>/<n> gói
+# Functional impact assessment — upgrade of <environment>
+<currentVersion> → <targetVersion> · <date> · coverage: <n>/<n> packages
 
-## Kết luận
-Ba đến năm câu. Bao nhiêu điểm phải xử lý trước, bao nhiêu quy trình cần kiểm thử,
-mức rủi ro (THẤP / TRUNG BÌNH / CAO) và vì sao. Không liệt kê chi tiết ở đây.
+## Conclusion
+Three to five sentences. How many items must be handled first, how many processes need
+re-testing, the risk level (LOW / MEDIUM / HIGH) and why. No detail here.
 
-## 🔴 Phải xử lý trước khi nâng cấp  (n)
-| # | Ảnh hưởng nghiệp vụ | Vùng | Ai xử lý |
-Một dòng cho mỗi finding severity=blocker. "Ai xử lý" là FC, Lập trình viên, hoặc cả hai —
-suy ra từ usedByCustomization: có customization dùng thì cần Lập trình viên.
-Sắp xếp: usedByCustomization=true lên trước, rồi theo vùng.
+## 🔴 Must be handled before the upgrade  (n)
+| # | Business impact | Area | Owner |
+One row per finding with severity=blocker. "Owner" is the consultant, a developer, or
+both — derive it from usedByCustomization: where the customization uses it, a developer
+is needed.
+Sort: usedByCustomization=true first, then by area.
 
-## 🟠 Cần kiểm thử lại — danh sách UAT  (n)
-| # | Quy trình cần kiểm thử | Vì sao | Vùng | Ưu tiên |
-Đây là bảng FC sẽ copy vào test plan, nên "Quy trình cần kiểm thử" phải là một hành động
-nghiệp vụ cụ thể ("Tạo và post Sales Order", "In Posted Sales Invoice"), không phải tên
-đối tượng. Gộp các finding cùng quy trình thành một dòng.
-Ưu tiên: Cao nếu có customization dùng hoặc là thay đổi cách tính số liệu, còn lại Trung bình.
+## 🟠 Needs re-testing — UAT list  (n)
+| # | Process to test | Why | Area | Priority |
+This is the table the consultant copies into a test plan, so "Process to test" must be a
+concrete business action ("Create and post a sales order", "Print a posted sales
+invoice"), not an object name. Merge findings that belong to the same process into one
+row.
+Priority: High where the customization is involved or where a calculation changed,
+Medium otherwise.
 
-## 🟢 Cơ hội bỏ bớt tuỳ chỉnh  (n)
-| Tính năng mới của Microsoft | Có thể thay thế | Ghi chú |
-Chỉ đưa vào khi thực sự nhìn thấy phần tuỳ chỉnh tương ứng trong ALGo-App/. Nếu chỉ là
-tính năng mới mà không rõ thay thế được gì, để ở "Đáng chú ý" bên dưới thay vì đoán.
+## 🟢 Opportunities to retire customization  (n)
+| New standard capability | Could replace | Notes |
+Only include a row when you can actually see the corresponding customization in
+ALGo-App/. If it is merely a new feature with no clear replacement, leave it out rather
+than guessing.
 
-## 🔍 Vùng KHÔNG kiểm tra được  (n)
-| Gói | Vì sao | Rủi ro còn lại |
-Lấy từ coverageGaps. Bắt buộc có nếu coverageGaps không rỗng.
+## 🔍 Areas that could NOT be checked  (n)
+| Package | Why | Residual risk |
+Taken from coverageGaps. Mandatory whenever coverageGaps is non-empty.
 
-## Phạm vi đã xét
-Một đoạn ngắn: những vùng nghiệp vụ nào được xét (areas.effective), vùng nào suy ra từ
-phần tuỳ chỉnh và vùng nào do team khai báo. Nêu rõ số thay đổi ở các vùng ngoài phạm vi
-(outOfScopeByArea) như một con số tổng, và nói thẳng rằng chúng không được đánh giá.
+## Scope considered
+A short paragraph: which business areas were examined (areas.effective), which of those
+came from the customization and which were declared by the team. Give the number of
+changes in areas outside that scope (outOfScopeByArea) as a single total, and say plainly
+that those were not assessed.
 ```
 
 ## 6. SELF-CHECK before answering
 
-1. Không có từ nào trong danh sách cấm ở section 3.
-2. Mọi đối tượng được gọi bằng `objectLabel`, không phải `objectName`.
-3. Số trong tiêu đề mỗi section khớp số dòng trong bảng của nó.
-4. Mỗi dòng trong bảng UAT là một hành động nghiệp vụ, không phải tên đối tượng.
-5. `coverageGaps` không rỗng thì section 🔍 phải có mặt.
-6. Không có finding nào không tồn tại trong `business-impact.json`.
-7. Kết luận nêu được mức rủi ro và lý do, không chỉ nhắc lại các con số.
+1. No term from the banned-vocabulary block in section 3 appears in the report.
+2. Every object is named by `objectLabel`, not `objectName`.
+3. The count in each section heading matches the number of rows in its table.
+4. Every row in the UAT table is a business action, not an object name.
+5. Where `coverageGaps` is non-empty, the 🔍 section is present.
+6. No finding appears that is not in `business-impact.json`.
+7. The conclusion gives a risk level and the reason for it, not just a restatement of the
+   numbers.
