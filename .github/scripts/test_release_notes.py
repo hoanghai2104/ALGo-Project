@@ -186,6 +186,77 @@ text = rn.render_markdown(notes)
 check('an unreachable Learn is stated as a gap, not as an all-clear',
       'gap in the report' in text)
 
+print('\nA missing page must not be mistaken for content')
+
+# The Learn server answers a 404 with HTTP 200 and a short apology in the body,
+# so a missing page would otherwise be recorded as a successful fetch and that
+# sentence quoted into the report as if Microsoft had written it.
+NOT_FOUND_BODY = ('The provided URL points to a page that could not be retrieved '
+                  '(possibly a 404 or network error).')
+
+check('the 404 apology body is recognised as not-a-document',
+      rn.not_a_document(NOT_FOUND_BODY) != '')
+check('a short heading-less body is recognised as not-a-document',
+      rn.not_a_document('Service temporarily unavailable.') != '')
+check('a real page is recognised as a document',
+      rn.not_a_document(UPDATE_PAGE) == '', '(got %r)' % rn.not_a_document(UPDATE_PAGE))
+check('a long body with no heading is still accepted',
+      rn.not_a_document('word ' * 200) == '')
+
+
+class _StubClient(rn.LearnClient):
+    def __init__(self, bodies):
+        rn.LearnClient.__init__(self)
+        self.bodies = bodies
+
+    def _post(self, method, params):
+        url = params.get('arguments', {}).get('url', '')
+        body = self.bodies.get(next((k for k in self.bodies if url.endswith(k)), ''),
+                               NOT_FOUND_BODY)
+        return 'data: %s' % json.dumps(
+            {'result': {'content': [{'type': 'text', 'text': body}]}})
+
+
+client = _StubClient({'deprecated-features-w1': DEPRECATIONS})
+try:
+    client.fetch('https://learn.microsoft.com/x/whatsnew/whatsnew-update-28-6')
+    check('fetching a missing page raises', False, '(no exception)')
+except ValueError as error:
+    check('fetching a missing page raises', 'could not be retrieved' in str(error))
+check('fetching a real page still works',
+      client.fetch('https://learn.microsoft.com/x/upgrade/deprecated-features-w1')
+      .startswith('# Deprecated features'))
+
+plan = rn.build_plan('28.5.0.0', '28.6.0.0')
+notes = rn.collect(plan, client.fetch)
+update_page = next(p for p in notes['pages'] if p['kind'] == 'update')
+check('a missing update page is recorded as unavailable',
+      update_page['available'] is False, '(got %r)' % update_page.get('available'))
+check('and it is counted as a failure, not passed over',
+      len(notes['failures']) == 1)
+check('the apology text never becomes page content',
+      'could not be retrieved' not in json.dumps(notes.get('pages')).replace(
+          update_page.get('error', ''), ''))
+
+print('\nUndateable deprecations are kept, not dropped')
+
+check('a window whose wave could not be read is flagged',
+      notes['wavesResolved'] is False, '(got %r)' % notes['wavesResolved'])
+deprecations = next(p for p in notes['pages'] if p['kind'] == 'deprecations')
+relevances = {s['relevance'] for s in deprecations['sections']}
+check('with no wave to compare against, nothing is dropped',
+      deprecations['sectionsDroppedAsPast'] == 0
+      and relevances == {'unclassified'},
+      '(dropped %d, relevances %r)' % (deprecations['sectionsDroppedAsPast'], relevances))
+check('and the in-window wave is still present in the kept sections',
+      any('2026 release wave 1' in s['heading'] for s in deprecations['sections']))
+
+notes_ok = rn.collect(rn.build_plan('28.4.0.0', '28.5.0.0'),
+                      _StubClient({'whatsnew-update-28-5': UPDATE_PAGE,
+                                   'deprecated-features-w1': DEPRECATIONS}).fetch)
+check('a window whose wave WAS read is marked resolved',
+      notes_ok['wavesResolved'] is True)
+
 print('\nDegraded path - the real script, offline, must still exit 0')
 
 out_dir = tempfile.mkdtemp()

@@ -158,6 +158,20 @@ def select_deprecations(markdown, window_waves, target_major):
     """
     kept = []
     dropped = 0
+
+    # With no wave to compare against - the update page was missing, so its
+    # title could not be read - nothing can be classified. Keeping everything
+    # and saying the classification is unreliable is the only honest option;
+    # dropping the dated sections would quietly discard the one that lands in
+    # this very upgrade.
+    if not window_waves:
+        for heading, body in split_sections(markdown):
+            if not heading or heading.strip().lower() in NAVIGATION_HEADINGS:
+                continue
+            kept.append({'heading': heading, 'wave': None, 'version': None,
+                         'relevance': 'unclassified', 'markdown': body})
+        return kept, dropped
+
     for heading, body in split_sections(markdown):
         if not heading:
             continue
@@ -195,6 +209,38 @@ def _wave_key(wave):
 # --------------------------------------------------------------------------
 # The Microsoft Learn MCP client - stdlib only
 # --------------------------------------------------------------------------
+
+# A URL that does not exist does NOT come back as an MCP error. The server
+# answers HTTP 200 with a short apology in the content, so a missing page would
+# otherwise be recorded as a successful fetch and that sentence would be quoted
+# into the report as if Microsoft had written it. Asking for
+# whatsnew-update-28-6 while 28.5 is the newest release is enough to trigger it,
+# which happens whenever the artifact feed is ahead of the documentation.
+NOT_RETRIEVED_MARKERS = (
+    'could not be retrieved',
+    'points to a page that could not',
+    'page not found',
+)
+
+# A real documentation page has a markdown heading. Anything short and
+# heading-less is a status message, not content - checked as well as the
+# sentinel above so a reworded message still cannot slip through.
+MINIMUM_DOCUMENT_CHARACTERS = 400
+
+
+def not_a_document(text):
+    """Why this response is not a documentation page, or '' if it is one."""
+    body = (text or '').strip()
+    lowered = body.lower()
+    for marker in NOT_RETRIEVED_MARKERS:
+        if marker in lowered:
+            return 'the page could not be retrieved (404 or network error)'
+    has_heading = any(line.startswith('#') for line in body.splitlines())
+    if not has_heading and len(body) < MINIMUM_DOCUMENT_CHARACTERS:
+        return ('the response is %d characters with no heading, so it is a status message '
+                'rather than a page' % len(body))
+    return ''
+
 
 class LearnClient(object):
     def __init__(self, url=MCP_URL, timeout=90):
@@ -244,6 +290,9 @@ class LearnClient(object):
         text = ''.join(part.get('text', '') for part in result.get('content', []))
         if not text.strip():
             raise ValueError('no content returned for %s' % url)
+        reason = not_a_document(text)
+        if reason:
+            raise ValueError('%s for %s' % (reason, url))
         return text
 
 
@@ -306,8 +355,14 @@ def collect(plan, fetch):
         # the artifact, and the count of what was dropped is kept with it.
         del entry['markdown']
 
+    # The wave is read from an update page title. If the window has updates but
+    # no page could be read, the deprecation list cannot be dated - which is
+    # reported rather than absorbed.
+    waves_resolved = bool(waves) or not plan['updates']
+
     return {
         'available': any(p.get('available') for p in pages),
+        'wavesResolved': waves_resolved,
         'source': 'Microsoft Learn MCP (%s)' % MCP_URL,
         'currentVersion': plan['currentVersion'],
         'targetVersion': plan['targetVersion'],
@@ -424,9 +479,15 @@ def command_fetch(args):
         print('  %-6s %-14s %-52s %s' % (status, page['kind'], page['version'], detail))
     if notes['failures']:
         print('::warning::%d Microsoft Learn page(s) could not be read: %s. Those feature '
-              'and deprecation notes are missing from the report.'
+              'and deprecation notes are missing from the report. A page for a version the '
+              'artifact feed already carries may simply not be published yet.'
               % (len(notes['failures']),
                  ', '.join(f['url'] for f in notes['failures'])))
+    if not notes['wavesResolved']:
+        print('::warning::No release wave could be read from any update page, so the '
+              'deprecation list could not be dated. Every section is kept and marked '
+              'unreliable rather than dropped - read that section in full instead of '
+              'trusting the grouping.')
 
     deprecation_counts = {}
     for page in notes['pages']:
