@@ -795,6 +795,8 @@ jobs:
       - name: Roll up business impact
         id: rollup
         shell: pwsh
+        env:
+          skipCopilot: ${{ inputs.skipCopilot }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
 
@@ -822,6 +824,37 @@ jobs:
             --resolution (Join-Path $reportFolder 'resolution.json') `
             --out-dir "$reportFolder"
           if ($LASTEXITCODE -ne 0) { throw "The business rollup failed (exit code $LASTEXITCODE)." }
+
+          $rollup = Get-Content -Path (Join-Path $reportFolder 'business-impact.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $counts = $rollup.counts
+          # Measure-Object over no properties returns $null, which would render
+          # as an empty cell rather than a zero.
+          $outOfScope = ($rollup.outOfScopeByArea.PSObject.Properties | Measure-Object -Property Value -Sum).Sum
+          if (!$outOfScope) { $outOfScope = 0 }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n## Functional rollup`n"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "| Metric | Value |`n| --- | --- |`n| Must be handled before the upgrade | $($counts.blocker) |`n| Needs re-testing | $($counts.retest) |`n| New capabilities | $($counts.opportunity) |`n| Business areas in scope | $(($rollup.areas.effective) -join ', ') |`n| Changes outside that scope | $outOfScope |`n| Coverage gaps | $($counts.coverageGaps) |"
+
+          # With the narrative step skipped there would otherwise be nothing
+          # readable in the summary, only counts. Serve the mechanical rollup
+          # instead of making the reader fetch the artifact.
+          if ($env:skipCopilot -eq 'true') {
+            $mechanical = Get-Content -Path (Join-Path $reportFolder 'business-impact.md') -Raw -Encoding UTF8
+            $maxBytes = 600KB
+            if ([System.Text.Encoding]::UTF8.GetByteCount($mechanical) -gt $maxBytes) {
+              $keep = $mechanical.Length
+              while ($keep -gt 0 -and [System.Text.Encoding]::UTF8.GetByteCount($mechanical.Substring(0, $keep)) -gt $maxBytes) {
+                $keep = [int]($keep * 0.9)
+              }
+              $mechanical = $mechanical.Substring(0, $keep) + "`n`n_(truncated - the full rollup is business-impact.md in the artifact)_"
+            }
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "<details>"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "<summary><b>Mechanical functional rollup</b> &mdash; no narrative report was requested (click to expand)</summary>"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $mechanical
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "</details>"
+          }
 
       # ------------------------------------------------------------------
       # Copilot turns the mechanical diff into an impact assessment scoped to
@@ -1026,22 +1059,72 @@ jobs:
             }
           }
 
-          # The functional report goes in the job summary: it is the shorter one
-          # and it has the wider readership. The technical report stays in the
-          # artifact, where the developers who need it will look.
-          # GITHUB_STEP_SUMMARY is capped at 1 MB.
-          $limit = 60000
+          # Both reports go into the job summary, so neither audience has to
+          # download an artifact to read their own document. The functional one
+          # is first and open; the technical one follows inside a collapsed
+          # <details> block, so a long developer report does not bury it.
+          #
+          # GITHUB_STEP_SUMMARY is capped at 1 MiB per step, and that cap is in
+          # BYTES. Vietnamese text runs up to 3 bytes per character in UTF-8, so
+          # a character count is not a byte count - measure what the limit
+          # actually measures.
+          $summaryBudget = 900KB
+
+          function Get-Utf8Length([string] $text) {
+            if (!$text) { return 0 }
+            return [System.Text.Encoding]::UTF8.GetByteCount($text)
+          }
+
+          function Limit-Utf8 {
+            param([string] $text, [int] $maxBytes, [string] $note)
+            if ((Get-Utf8Length $text) -le $maxBytes) { return $text }
+            $noteRoom = (Get-Utf8Length $note) + 16
+            $keep = $text.Length
+            while ($keep -gt 0 -and (Get-Utf8Length $text.Substring(0, $keep)) -gt ($maxBytes - $noteRoom)) {
+              $keep = [int]($keep * 0.9)
+            }
+            return $text.Substring(0, $keep) + "`n`n$note"
+          }
+
+          $functionalText = ''
+          $technicalText = ''
           if (Test-Path $functionalReportFile) {
             $functionalText = Get-Content -Path $functionalReportFile -Raw -Encoding UTF8
-            if ($functionalText.Length -gt $limit) {
-              $functionalText = $functionalText.Substring(0, $limit) + "`n`n_(truncated - the full report is functional-impact.md in the artifact)_"
-            }
+          }
+          if (Test-Path $technicalReportFile) {
+            $technicalText = Get-Content -Path $technicalReportFile -Raw -Encoding UTF8
+          }
+
+          # The functional report is served first: it is the shorter one and has
+          # the wider readership. Whatever it does not use is left to the
+          # technical report rather than being reserved and wasted.
+          $artifactName = "upgrade-analysis-$($env:ALGoEnvName)"
+          if ($functionalText) {
+            $functionalText = Limit-Utf8 $functionalText (300KB) `
+              "_(cắt bớt - bản đầy đủ là functional-impact.md trong artifact ``$artifactName``)_"
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n"
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $functionalText
           }
-          if (Test-Path $technicalReportFile) {
-            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n`n_The technical report for developers is technical-analysis.md in the ``upgrade-analysis-$($env:ALGoEnvName)`` artifact._"
+
+          if ($technicalText) {
+            $remaining = $summaryBudget - (Get-Utf8Length $functionalText)
+            if ($remaining -lt 20KB) { $remaining = 20KB }
+            $technicalText = Limit-Utf8 $technicalText $remaining `
+              "_(truncated - the full report is technical-analysis.md in the ``$artifactName`` artifact)_"
+
+            # A blank line after </summary> is what makes GitHub render the
+            # markdown inside the collapsed block instead of showing it raw.
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n---`n"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "<details>"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "<summary><b>Technical report for developers</b> &mdash; $($env:currentVersion) -> $($env:targetVersion) (click to expand)</summary>"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value $technicalText
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "</details>"
           }
+
+          Write-Host ("Job summary: functional {0:N0} bytes, technical {1:N0} bytes, budget {2:N0}" -f `
+            (Get-Utf8Length $functionalText), (Get-Utf8Length $technicalText), $summaryBudget)
 
       # ------------------------------------------------------------------
       # Check the functional report against its own contract.
