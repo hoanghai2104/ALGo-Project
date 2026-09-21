@@ -136,5 +136,9 @@ codeunit 50114 BusinessEventHandler
         OnShipToAddressAfterInsert(Rec.SystemId, Rec.msdyn_FunctionalLocationId);
     end;
 
-
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Gen. Jnl.-Post Line", OnBeforeInsertDeferralNonDeductibleVATGLEntries, '', false, false)]
+    local procedure OnBeforeInsertDeferralNonDeductibleVATGLEntries(var NonDeductibleVATPct: Decimal; DeferralPostingBuffer: Record "Deferral Posting Buffer"; VATPostingSetup: Record "VAT Posting Setup"; GenJournalLine: Record "Gen. Journal Line"; DeferralTemplate: Record "Deferral Template"; var VATAmountRounding: Decimal; var PositiveNDVATAmountRounding: Decimal; var NegativeNDVATAmountRounding: Decimal; var IsHandled: Boolean)
+    begin
+        //TODO...
+    end;
 }
